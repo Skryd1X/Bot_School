@@ -1,7 +1,7 @@
 # db.py
 import os
 import datetime as dt
-from typing import Optional, Literal, Tuple
+from typing import Optional, Literal, Tuple, List  # --- added/updated ---
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
@@ -57,10 +57,15 @@ def _to_aware_utc(value) -> Optional[dt.datetime]:
 
 async def ensure_user(chat_id: int) -> dict:
     """Возвращает (и создаёт при необходимости) документ пользователя; обнуляет счётчики при новом месяце.
-       Попутно нормализует sub_expires_at к tz-aware UTC, если раньше сохранилось naive."""
+       Попутно нормализует sub_expires_at к tz-aware UTC, если раньше сохранилось naive.
+       Также добавляет/мигрирует поле optin для рассылок.  # --- added/updated ---"""
     now = _now_utc()
     doc = await users.find_one({"chat_id": chat_id})
     if doc:
+        # --- миграция optin: если поля нет, включаем подписку по умолчанию
+        if "optin" not in doc:
+            await users.update_one({"chat_id": chat_id}, {"$set": {"optin": True}})
+            doc["optin"] = True
         # Миграция: нормализуем дату подписки к aware UTC
         raw_exp = doc.get("sub_expires_at")
         norm_exp = _to_aware_utc(raw_exp)
@@ -87,6 +92,7 @@ async def ensure_user(chat_id: int) -> dict:
         "period_month": _month_key(now),
         "text_used": 0,
         "photo_used": 0,
+        "optin": True,            # --- added/updated --- подписка на рассылки по умолчанию
     }
     await users.insert_one(doc)
     return doc
@@ -196,3 +202,21 @@ async def get_status_text(chat_id: int) -> str:
             f"Текстовые запросы: {tu}/{text_limit}\n"
             f"Решения по фото: {pu}/{photo_limit}\n\n"
             f"Обновите план: /plan")
+
+# -------------------------------
+# Рассылки / подписки (optin)    # --- added/updated ---
+# -------------------------------
+
+async def set_optin(chat_id: int, optin: bool = True) -> None:
+    """Включить/выключить подписку на рассылки для пользователя."""
+    await users.update_one({"chat_id": chat_id}, {"$set": {"optin": optin}}, upsert=True)
+
+async def get_all_chat_ids(optin_only: bool = True) -> List[int]:
+    """Получить список chat_id для рассылки. Если optin_only=True — только подписанные."""
+    query = {"optin": True} if optin_only else {}
+    cursor = users.find(query, {"chat_id": 1, "_id": 0})
+    return [doc["chat_id"] async for doc in cursor]
+
+async def drop_chat(chat_id: int) -> None:
+    """Удалить (или пометить) мёртвый чат из базы — например, если пользователь заблокировал бота."""
+    await users.delete_one({"chat_id": chat_id})
