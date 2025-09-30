@@ -374,7 +374,7 @@ async def cmd_admin_open(message: Message):
     await message.answer("Админ-панель:", reply_markup=ADMIN_KB)
 
 # Выход из админ-режима
-@router.message(Text(equals="⏪ Выйти из админ режима"))
+@router.message(F.text == "⏪ Выйти из админ режима")
 async def admin_logout(message: Message):
     uid = message.from_user.id
     if is_admin(uid):
@@ -418,7 +418,7 @@ def _confirm_kb(kind: str) -> InlineKeyboardMarkup:
     ]])
 
 # ---------- РАССЫЛКА ТЕКСТОМ (с подтверждением и прогрессом) ----------
-@router.message(Text(equals="📢 Рассылка — текст"))
+@router.message(F.text == "📢 Рассылка — текст")
 async def admin_broadcast_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
@@ -448,7 +448,7 @@ async def admin_broadcast_receive_text(message: Message, state: FSMContext):
     )
 
 # ---------- РАССЫЛКА ФОТО (с подтверждением и прогрессом) ----------
-@router.message(Text(equals="🖼️ Рассылка — фото"))
+@router.message(F.text == "🖼️ Рассылка — фото")
 async def admin_broadcast_photo_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
@@ -635,7 +635,7 @@ async def bcast_confirm_photo(call: CallbackQuery, state: FSMContext):
     await call.message.answer("Готово. Возвращаю админ-меню.", reply_markup=ADMIN_KB)
     await call.answer()
 
-@router.message(Text(equals="📊 Кол-во подписчиков"))
+@router.message(F.text == "📊 Кол-во подписчиков")
 async def admin_count(message: Message):
     if not is_admin(message.from_user.id):
         return
