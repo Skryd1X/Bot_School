@@ -22,8 +22,8 @@ from aiogram.enums import ChatAction
 
 from generators import stream_response_text, solve_from_image
 from db import (
-    ensure_user, can_use, inc_usage, get_status_text,  # лимиты / статус
-    get_all_chat_ids, drop_chat, set_optin            # --- added admin ---
+    ensure_user, can_use, inc_usage, get_status_text,
+    get_all_chat_ids, drop_chat, set_optin, set_optin_for_all  # ← добавили
 )
 
 router = Router()

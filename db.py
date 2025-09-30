@@ -58,7 +58,7 @@ def _to_aware_utc(value) -> Optional[dt.datetime]:
 async def ensure_user(chat_id: int) -> dict:
     """Возвращает (и создаёт при необходимости) документ пользователя; обнуляет счётчики при новом месяце.
        Попутно нормализует sub_expires_at к tz-aware UTC, если раньше сохранилось naive.
-       Также добавляет/мигрирует поле optin для рассылок.  # --- added/updated ---"""
+       Также добавляет/мигрирует поле optin для рассылок."""
     now = _now_utc()
     doc = await users.find_one({"chat_id": chat_id})
     if doc:
@@ -92,7 +92,7 @@ async def ensure_user(chat_id: int) -> dict:
         "period_month": _month_key(now),
         "text_used": 0,
         "photo_used": 0,
-        "optin": True,            # --- added/updated --- подписка на рассылки по умолчанию
+        "optin": True,            # подписка на рассылки по умолчанию
     }
     await users.insert_one(doc)
     return doc
@@ -192,7 +192,7 @@ async def get_status_text(chat_id: int) -> str:
                 f"Решения по фото: безлимит (использовано {pu})")
 
     if active and plan == "lite":
-        exp_s = exp.strftime("%Y-%m-%d %H:%M UTC")
+        exp_s = exp.strftime("%Y-%m-%d %H:%М UTC")
         return (f"📦 План: LITE (активен до {exp_s})\n"
                 f"Текстовые запросы: {tu}/{text_limit}\n"
                 f"Решения по фото: {pu}/{photo_limit}")
@@ -204,16 +204,27 @@ async def get_status_text(chat_id: int) -> str:
             f"Обновите план: /plan")
 
 # -------------------------------
-# Рассылки / подписки (optin)    # --- added/updated ---
+# Рассылки / подписки (optin)
 # -------------------------------
 
 async def set_optin(chat_id: int, optin: bool = True) -> None:
     """Включить/выключить подписку на рассылки для пользователя."""
     await users.update_one({"chat_id": chat_id}, {"$set": {"optin": optin}}, upsert=True)
 
+async def set_optin_for_all(value: bool = True) -> int:
+    """Массово проставить optin всем пользователям. Возвращает число изменённых документов."""
+    res = await users.update_many({}, {"$set": {"optin": value}})
+    return getattr(res, "modified_count", 0)
+
 async def get_all_chat_ids(optin_only: bool = True) -> List[int]:
-    """Получить список chat_id для рассылки. Если optin_only=True — только подписанные."""
-    query = {"optin": True} if optin_only else {}
+    """
+    Получить список chat_id для рассылки.
+    Если optin_only=True — берём тех, у кого optin=True ИЛИ поле optin отсутствует (по умолчанию считаем True).
+    """
+    if optin_only:
+        query = {"$or": [{"optin": True}, {"optin": {"$exists": False}}]}
+    else:
+        query = {}
     cursor = users.find(query, {"chat_id": 1, "_id": 0})
     return [doc["chat_id"] async for doc in cursor]
 
