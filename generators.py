@@ -6,133 +6,123 @@ from typing import AsyncIterator, List, Dict, Any
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
-# -----------------------------------------------------------------------------
-# init
-# -----------------------------------------------------------------------------
 load_dotenv()
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
-base_url       = os.getenv("OPENAI_BASE_URL")  # можно не указывать
-TEXT_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-VISION_MODEL   = os.getenv("OPENAI_VISION_MODEL", TEXT_MODEL)   # для OCR можно поставить "gpt-4o"
-MAX_TOKENS_ENV = int(os.getenv("OPENAI_MAX_TOKENS", "900"))     # ограничим длину ответа
+base_url     = os.getenv("OPENAI_BASE_URL")  # опционально
+TEXT_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", TEXT_MODEL)
 
 client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
 
-# -----------------------------------------------------------------------------
-# системные инструкции (жёсткие, всегда добавляются)
-# -----------------------------------------------------------------------------
+# --- Базовая системка (для всех предметов) ---
 SYSTEM_SCHOOL = (
-    "Ты — школьный помощник-репетитор. Всегда отвечай на русском. "
-    "Работай по всем школьным предметам: математика, физика, химия, биология, география, история, обществознание, "
-    "русский язык, литература, информатика, английский (переводы/объяснения по-русски), а также проекты/рефераты. "
-    "Правила:\n"
-    "1) Отвечай кратко и по шагам, без воды. При необходимости структурируй в пункты.\n"
-    "2) В задачах по точным наукам показывай: краткую запись (ДАНО/НАЙТИ), формулы, подстановку, вычисления с единицами, "
-    "проверку размерностей (если уместно) и в конце 'ИТОГ: ...' одной строкой.\n"
-    "3) Если данных не хватает — явно укажи каких и предложи разумные предположения; не выдумывай факты.\n"
-    "4) По русскому и литературе: дай тезисный план, подбери аргументы, анализируй средства выразительности и композицию; "
-    "сочинение пиши логично и без плагиата.\n"
-    "5) По гуманитарным предметам: чёткие определения, краткие сравнения, хронология (если нужна), ключевые мысли.\n"
+    "Ты — помощник-репетитор. Отвечай на русском, чётко и по делу. "
+    "Поддерживаешь задачи от школы до ВУЗа: математика, физика, химия, "
+    "инженерные дисциплины (сопромат/теормех/МС), гуманитарные, языки и т.д. "
+    "Если данных не хватает для ответа — кратко напомни, чего не хватает, "
+    "и не выдумывай отсутствующие числа."
 )
 
-# Строгий формат под Telegram (без LaTeX)
+# --- Формат по умолчанию (коротко, структурировано) ---
 SCHOOL_FORMAT_NOTE = (
-    "Форматируй строго без LaTeX/TeX (никаких $, \\, \\( \\), \\frac и т.п.). "
-    "Используй обычные символы и единицы СИ. Дроби — через '/', умножение — '*', степень — '^'.\n"
-    "Рекомендуемый шаблон для задач:\n"
-    "ДАНО:\n- ...\nНАЙТИ:\n- ...\nФОРМУЛЫ:\n- ...\nРЕШЕНИЕ:\n- ...\nПОДСТАНОВКА:\n- ...\nИТОГ: ...\n"
-    "Для сочинений: сначала короткий план (3–5 пунктов), затем связный текст на 8–12 предложений."
+    "Форматируй строго без LaTeX. Обычный текст. "
+    "Если задача расчётная — показывай кратко ключевые шаги и финальные числа с единицами."
 )
 
-# -----------------------------------------------------------------------------
-# helpers
-# -----------------------------------------------------------------------------
-async def _chat_stream(messages: List[Dict[str, Any]], *, model: str) -> AsyncIterator[str]:
-    """
-    Общий стример для chat.completions с фолбэком модели.
-    """
-    try:
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.4,
-            max_tokens=MAX_TOKENS_ENV,
-            stream=True,
-        )
-    except Exception:
-        # Фолбэк на gpt-4o-mini, если указанная модель недоступна
-        fb = "gpt-4o-mini"
-        stream = await client.chat.completions.create(
-            model=fb,
-            messages=messages,
-            temperature=0.4,
-            max_tokens=MAX_TOKENS_ENV,
-            stream=True,
-        )
+# --- Инженерный режим для сопромата / МС / статики ---
+ENGINEERING_RULES = (
+    "РЕЖИМ: ИНЖЕНЕРНЫЕ РАСЧЁТЫ (статика/балки/фермы/МС).\n"
+    "Требования к ответу:\n"
+    "1) Чётко распарсить исходные данные: тип опор/закреплений, элементы схемы, участки, приложенные нагрузки.\n"
+    "2) Если чисел нет или не хватает — ДОСПРОСИ недостающие (например: q, F, координаты, M, L, EI и т.п.). "
+    "   Не переходи к итогам без численных значений ключевых величин.\n"
+    "3) Выписать уравнения равновесия (ΣFy=0, ΣMx=0) с обозначениями реакций. Указать выбранную точку для моментов.\n"
+    "4) Найти реакции опор ЧИСЛАМИ. Привести подстановку и единицы (кН, кН·м, м и т.д.).\n"
+    "5) Если задача про балки — задать Q(x) и M(x) по участкам (коротко, только нужные куски),\n"
+    "   показать ключевые значения (экстремумы/границы участков) и финальные максимумы |Q|, |M|.\n"
+    "6) Контроль: ΣFy≈0 и ΣM≈0 (с округлением).\n"
+    "7) Итог: компактный список найденных величин с единицами. Никакой LaTeX.\n"
+    "8) Если система статически неопределима — явно скажи степень неопределимости и какой метод нужен (метод сил/трёх моментов/канонические уравнения), "
+    "   какие доп.параметры требуются (например EI), и что без них численно не решить.\n"
+)
 
+# --- Триггеры для включения инженерного режима ---
+ENGINEERING_KEYWORDS = {
+    "балка","ферма","опора","шарнир","защемление","реакция","реакции",
+    "кн","кн/м","н/м","кн*м","кн·м","момент","изгибающий","поперечная сила",
+    "диаграмма","q(","q=","F=","M=","EI","сопромат","статик","МС","прочность"
+}
+
+def _needs_engineering_mode(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in ENGINEERING_KEYWORDS)
+
+def _build_messages(user_text: str, history: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_SCHOOL},
+        {"role": "system", "content": SCHOOL_FORMAT_NOTE},
+    ]
+    if _needs_engineering_mode(user_text):
+        messages.append({"role": "system", "content": ENGINEERING_RULES})
+        # для инженерных задач делаем модель «построже»
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+async def stream_chat(messages: List[Dict[str, Any]], temperature: float = 0.4) -> AsyncIterator[str]:
+    stream = await client.chat.completions.create(
+        model=TEXT_MODEL,
+        messages=messages,
+        temperature=temperature,
+        stream=True,
+    )
     async for chunk in stream:
         delta = (chunk.choices[0].delta.content or "")
         if delta:
             yield delta
 
-# -----------------------------------------------------------------------------
-# public API
-# -----------------------------------------------------------------------------
 async def stream_response_text(user_text: str, history: List[Dict[str, str]]) -> AsyncIterator[str]:
-    """
-    Стриминг ответа с учётом истории. Всегда включает SYSTEM_SCHOOL + SCHOOL_FORMAT_NOTE.
-    """
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_SCHOOL},
-        {"role": "system", "content": SCHOOL_FORMAT_NOTE},
-    ]
-    if history:
-        messages.extend(history)
-    messages.append({"role": "user", "content": user_text})
-
-    async for delta in _chat_stream(messages, model=TEXT_MODEL):
+    # Если инженерная задача — жёстче зажимаем температуру
+    temp = 0.15 if _needs_engineering_mode(user_text) else 0.4
+    messages = _build_messages(user_text, history)
+    async for delta in stream_chat(messages, temperature=temp):
         yield delta
 
-
 async def solve_from_image(image_bytes: bytes, hint: str, history: List[Dict[str, str]]) -> str:
-    """
-    Решение задачи с изображения (мультимодальный chat.completions).
-    Передаём картинку как data-url в image_url.
-    """
     data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("utf-8")
+
+    # усиливаем подсказку для картинок с инженерными схемами
+    extra_eng = (
+        "Если на изображении инженерная схема (балка/ферма/нагрузки/опоры): "
+        "1) считать размеры/сектора/обозначения; 2) выписать ΣFy=0, ΣM=0; "
+        "3) найти реакции ЧИСЛАМИ при наличии q, F, M, L; "
+        "4) если данных мало — кратко спросить недостающее; "
+        "5) итог с единицами. "
+    )
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_SCHOOL},
         {"role": "system", "content": SCHOOL_FORMAT_NOTE},
+        {"role": "system", "content": ENGINEERING_RULES},  # подсобит распознаванию инженерных схем
     ]
     if history:
         messages.extend(history)
     messages.append({
         "role": "user",
         "content": [
-            {"type": "text", "text": hint or "Распознай условие с фото и реши задачу по шагам в указанном формате."},
+            {"type": "text", "text": (hint or "Распознай условие и реши по шагам.") + " " + extra_eng},
             {"type": "image_url", "image_url": {"url": data_url}},
         ],
     })
 
-    try:
-        resp = await client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=MAX_TOKENS_ENV,
-        )
-    except Exception:
-        # фолбэк на 4o-mini
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.3,
-            max_tokens=MAX_TOKENS_ENV,
-        )
-
+    resp = await client.chat.completions.create(
+        model=VISION_MODEL,
+        messages=messages,
+        temperature=0.15,
+    )
     return resp.choices[0].message.content or ""
