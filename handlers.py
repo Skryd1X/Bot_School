@@ -11,14 +11,20 @@ from aiogram.types import (
     CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardRemove,  # --- added admin ---
 )
 from aiogram.filters import CommandStart, StateFilter, Command
+from aiogram.filters import Text  # --- added admin ---
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State  # --- added admin ---
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.enums import ChatAction
 
 from generators import stream_response_text, solve_from_image
-from db import ensure_user, can_use, inc_usage, get_status_text  # лимиты / статус
+from db import (
+    ensure_user, can_use, inc_usage, get_status_text,  # лимиты / статус
+    get_all_chat_ids, drop_chat, set_optin            # --- added admin ---
+)
 
 router = Router()
 
@@ -225,7 +231,7 @@ async def kb_reset(message: Message, state: FSMContext):
     await state.clear()
     await cmd_reset(message)
 
-# ---------- FAQ / Помощь (добавлено) ----------
+# ---------- FAQ / Помощь ----------
 FAQ_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Как пользоваться ботом")],
@@ -305,6 +311,221 @@ async def faq_offer(message: Message):
 @router.message(F.text == "Назад")
 async def faq_back(message: Message):
     await message.answer("Возврат в главное меню", reply_markup=MAIN_KB)
+
+# ---------- Admin panel: вход по секретному коду, рассылки ----------
+
+# Хранилище админов (до 2-х), доступ по секретному коду из .env
+import json
+from pathlib import Path
+
+SECRET_ADMIN_CODES = {c.strip() for c in os.getenv("SECRET_ADMIN_CODES", "").split(",") if c.strip()}
+ADMINS_FILE = Path("admins.json")
+MAX_ADMINS = 2
+ADMINS: set[int] = set()
+
+def _load_admins():
+    global ADMINS
+    if ADMINS_FILE.exists():
+        try:
+            data = json.loads(ADMINS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                ADMINS = set(int(x) for x in data)
+        except Exception:
+            ADMINS = set()
+
+def _save_admins():
+    try:
+        ADMINS_FILE.write_text(json.dumps(sorted(list(ADMINS))), encoding="utf-8")
+    except Exception:
+        pass
+
+_load_admins()
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
+
+ADMIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📢 Рассылка — текст"), KeyboardButton(text="🖼️ Рассылка — фото")],
+        [KeyboardButton(text="📊 Кол-во подписчиков"), KeyboardButton(text="⏪ Выйти из админ режима")],
+    ],
+    resize_keyboard=True,
+)
+
+# Секретный вход (сообщение целиком равно секретному коду)
+@router.message(lambda m: (m.text or "").strip() in SECRET_ADMIN_CODES)
+async def secret_code_grant(message: Message):
+    uid = message.from_user.id
+    if is_admin(uid):
+        return await message.answer("Вы уже в админ-режиме.", reply_markup=ADMIN_KB)
+
+    if len(ADMINS) >= MAX_ADMINS:
+        return await message.answer("Нельзя добавить нового админа — достигнут лимит (2 админа).", reply_markup=MAIN_KB)
+
+    ADMINS.add(uid)
+    _save_admins()
+    await message.answer("✅ Вы добавлены как админ. Открываю админ-панель.", reply_markup=ADMIN_KB)
+
+# Переоткрыть панель, если уже админ
+@router.message(Command("admin"))
+async def cmd_admin_open(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("⛔ Доступно только админам.")
+    await message.answer("Админ-панель:", reply_markup=ADMIN_KB)
+
+# Выход из админ-режима
+@router.message(Text(equals="⏪ Выйти из админ режима"))
+async def admin_logout(message: Message):
+    uid = message.from_user.id
+    if is_admin(uid):
+        ADMINS.discard(uid)
+        _save_admins()
+        await message.answer("Вы вышли из админ-режима.", reply_markup=MAIN_KB)
+    else:
+        await message.answer("Вы не в админ-режиме.", reply_markup=MAIN_KB)
+
+# Подписка/отписка для пользователей (опционально; пригодится для рассылок)
+@router.message(Command("unsubscribe"))
+async def cmd_unsub(message: Message):
+    await set_optin(message.chat.id, False)
+    await message.answer("❌ Вы отписаны от рассылок. Включить снова: /subscribe")
+
+@router.message(Command("subscribe"))
+async def cmd_sub(message: Message):
+    await set_optin(message.chat.id, True)
+    await message.answer("✅ Вы подписаны на рассылки. Отключить: /unsubscribe")
+
+# Состояния для рассылок
+class AdminBroadcastStates(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_photo = State()
+    waiting_for_caption = State()
+
+BROADCAST_CONCURRENCY = 20
+BROADCAST_DELAY_SEC   = 0.03
+
+# Старт рассылки текстом
+@router.message(Text(equals="📢 Рассылка — текст"))
+async def admin_broadcast_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminBroadcastStates.waiting_for_text)
+    await message.answer("📝 Пришлите текст рассылки (или /cancel):", reply_markup=ReplyKeyboardRemove())
+
+@router.message(AdminBroadcastStates.waiting_for_text)
+async def admin_broadcast_receive_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Пустой текст — отмена.", reply_markup=ADMIN_KB)
+        await state.clear()
+        return
+
+    await message.answer("🚀 Запускаю рассылку (текст). Отчёт будет после завершения.", reply_markup=ADMIN_KB)
+    await state.clear()
+
+    async def do_broadcast():
+        chat_ids = await get_all_chat_ids(optin_only=True)
+        total = len(chat_ids)
+        sent = 0
+        failed = 0
+        sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+
+        async def worker(cid: int):
+            nonlocal sent, failed
+            async with sem:
+                try:
+                    await message.bot.send_message(cid, text)
+                    sent += 1
+                except Exception:
+                    try:
+                        await drop_chat(cid)
+                    except Exception:
+                        pass
+                    failed += 1
+                await asyncio.sleep(BROADCAST_DELAY_SEC)
+
+        await asyncio.gather(*(worker(cid) for cid in chat_ids))
+        await message.answer(f"✅ Рассылка завершена.\nВсего: {total}\nОтправлено: {sent}\nОшибок/очищено: {failed}", reply_markup=ADMIN_KB)
+
+    asyncio.create_task(do_broadcast())
+
+# Старт рассылки фото
+@router.message(Text(equals="🖼️ Рассылка — фото"))
+async def admin_broadcast_photo_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminBroadcastStates.waiting_for_photo)
+    await message.answer("🖼️ Пришлите фото (файл/URL/file_id) для рассылки, или /cancel:", reply_markup=ReplyKeyboardRemove())
+
+@router.message(AdminBroadcastStates.waiting_for_photo)
+async def admin_broadcast_photo_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    photo_file_id = None
+    if message.photo:
+        photo_file_id = message.photo[-1].file_id
+    else:
+        txt = (message.text or "").strip()
+        if txt:
+            photo_file_id = txt  # URL или file_id
+
+    if not photo_file_id:
+        await message.answer("Не распознано фото/URL. Отмена.", reply_markup=ADMIN_KB)
+        await state.clear()
+        return
+
+    await state.update_data(photo_file_id=photo_file_id)
+    await state.set_state(AdminBroadcastStates.waiting_for_caption)
+    await message.answer("Пришлите подпись (или пустое сообщение, чтобы без подписи):", reply_markup=ReplyKeyboardRemove())
+
+@router.message(AdminBroadcastStates.waiting_for_caption)
+async def admin_broadcast_photo_caption(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    photo_file_id = data.get("photo_file_id")
+    caption = (message.text or "").strip() or None
+    await state.clear()
+    await message.answer("🚀 Запускаю рассылку фото. Отчёт будет после завершения.", reply_markup=ADMIN_KB)
+
+    async def do_broadcast_photo():
+        chat_ids = await get_all_chat_ids(optin_only=True)
+        total = len(chat_ids)
+        sent = 0
+        failed = 0
+        sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+
+        async def worker(cid: int):
+            nonlocal sent, failed
+            async with sem:
+                try:
+                    await message.bot.send_photo(cid, photo=photo_file_id, caption=caption)
+                    sent += 1
+                except Exception:
+                    try:
+                        await drop_chat(cid)
+                    except Exception:
+                        pass
+                    failed += 1
+                await asyncio.sleep(BROADCAST_DELAY_SEC)
+
+        await asyncio.gather(*(worker(cid) for cid in chat_ids))
+        await message.answer(f"✅ Рассылка (фото) завершена.\nВсего: {total}\nОтправлено: {sent}\nОшибок/очищено: {failed}", reply_markup=ADMIN_KB)
+
+    asyncio.create_task(do_broadcast_photo())
+
+@router.message(Command("cancel"))
+async def admin_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=ADMIN_KB if is_admin(message.from_user.id) else MAIN_KB)
 
 # ---------- Callback-кнопки под статусом ----------
 @router.callback_query(F.data == "show_plans")
