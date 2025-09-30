@@ -14,7 +14,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,  # --- added admin ---
 )
 from aiogram.filters import CommandStart, StateFilter, Command
-from aiogram.filters import Text  # --- added admin ---
+# from aiogram.filters import Text  # --- removed, not in aiogram 3.x ---
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State  # --- added admin ---
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
@@ -400,11 +400,24 @@ class AdminBroadcastStates(StatesGroup):
     waiting_for_text = State()
     waiting_for_photo = State()
     waiting_for_caption = State()
+    confirm = State()  # --- admin confirm/progress ---
 
 BROADCAST_CONCURRENCY = 20
 BROADCAST_DELAY_SEC   = 0.03
 
-# Старт рассылки текстом
+def _progress_bar(pct: float, width: int = 12) -> str:
+    """Вернёт строку прогресс-бара вида [██████----] 50%"""
+    done = int(round(pct * width))
+    return f"[{'█'*done}{'—'*(width-done)}] {int(pct*100)}%"
+
+def _confirm_kb(kind: str) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения: kind='text'|'photo'"""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"bcast_confirm_{kind}"),
+        InlineKeyboardButton(text="❌ Отменить",    callback_data="bcast_cancel"),
+    ]])
+
+# ---------- РАССЫЛКА ТЕКСТОМ (с подтверждением и прогрессом) ----------
 @router.message(Text(equals="📢 Рассылка — текст"))
 async def admin_broadcast_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -424,36 +437,17 @@ async def admin_broadcast_receive_text(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    await message.answer("🚀 Запускаю рассылку (текст). Отчёт будет после завершения.", reply_markup=ADMIN_KB)
-    await state.clear()
+    # Посчитаем аудиторию и спросим подтверждение
+    chat_ids = await get_all_chat_ids(optin_only=True)
+    await state.update_data(kind="text", text=text, audience=chat_ids)
+    await state.set_state(AdminBroadcastStates.confirm)
+    await message.answer(
+        f"Будет отправлено *текстовое* сообщение {len(chat_ids)} получателям.\nПодтверждаете?",
+        reply_markup=_confirm_kb("text"),
+        parse_mode="Markdown"
+    )
 
-    async def do_broadcast():
-        chat_ids = await get_all_chat_ids(optin_only=True)
-        total = len(chat_ids)
-        sent = 0
-        failed = 0
-        sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
-
-        async def worker(cid: int):
-            nonlocal sent, failed
-            async with sem:
-                try:
-                    await message.bot.send_message(cid, text)
-                    sent += 1
-                except Exception:
-                    try:
-                        await drop_chat(cid)
-                    except Exception:
-                        pass
-                    failed += 1
-                await asyncio.sleep(BROADCAST_DELAY_SEC)
-
-        await asyncio.gather(*(worker(cid) for cid in chat_ids))
-        await message.answer(f"✅ Рассылка завершена.\nВсего: {total}\nОтправлено: {sent}\nОшибок/очищено: {failed}", reply_markup=ADMIN_KB)
-
-    asyncio.create_task(do_broadcast())
-
-# Старт рассылки фото
+# ---------- РАССЫЛКА ФОТО (с подтверждением и прогрессом) ----------
 @router.message(Text(equals="🖼️ Рассылка — фото"))
 async def admin_broadcast_photo_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -480,6 +474,7 @@ async def admin_broadcast_photo_received(message: Message, state: FSMContext):
         await state.clear()
         return
 
+    # Спросим подпись
     await state.update_data(photo_file_id=photo_file_id)
     await state.set_state(AdminBroadcastStates.waiting_for_caption)
     await message.answer("Пришлите подпись (или пустое сообщение, чтобы без подписи):", reply_markup=ReplyKeyboardRemove())
@@ -489,38 +484,163 @@ async def admin_broadcast_photo_caption(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await state.clear()
         return
-
     data = await state.get_data()
     photo_file_id = data.get("photo_file_id")
     caption = (message.text or "").strip() or None
+
+    # Посчитаем аудиторию и спросим подтверждение
+    chat_ids = await get_all_chat_ids(optin_only=True)
+    await state.update_data(kind="photo", photo_file_id=photo_file_id, caption=caption, audience=chat_ids)
+    await state.set_state(AdminBroadcastStates.confirm)
+    await message.answer(
+        f"Будет отправлено *фото* {len(chat_ids)} получателям.\nПодтверждаете?",
+        reply_markup=_confirm_kb("photo"),
+        parse_mode="Markdown"
+    )
+
+# ---------- Подтверждение / Отмена ----------
+@router.callback_query(F.data == "bcast_cancel")
+async def bcast_cancel(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Нет доступа")
     await state.clear()
-    await message.answer("🚀 Запускаю рассылку фото. Отчёт будет после завершения.", reply_markup=ADMIN_KB)
+    await call.message.edit_text("❌ Рассылка отменена.")
+    await call.message.answer("Возвращаю админ-меню.", reply_markup=ADMIN_KB)
+    await call.answer()
 
-    async def do_broadcast_photo():
-        chat_ids = await get_all_chat_ids(optin_only=True)
-        total = len(chat_ids)
-        sent = 0
-        failed = 0
-        sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+@router.callback_query(F.data == "bcast_confirm_text")
+async def bcast_confirm_text(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Нет доступа")
+    data = await state.get_data()
+    if data.get("kind") != "text":
+        return await call.answer("Нет данных для рассылки", show_alert=True)
 
-        async def worker(cid: int):
-            nonlocal sent, failed
-            async with sem:
+    text: str = data["text"]
+    chat_ids: List[int] = data["audience"]
+    await state.clear()
+
+    # Статусное сообщение с прогресс-баром
+    total = len(chat_ids)
+    sent = 0
+    failed = 0
+    status_msg = await call.message.edit_text(f"🚀 Старт рассылки (текст)\n{_progress_bar(0)}\n0 / {total}")
+    lock = asyncio.Lock()
+
+    sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+    last_edit_ts = time.monotonic()
+
+    async def worker(cid: int):
+        nonlocal sent, failed, last_edit_ts
+        async with sem:
+            try:
+                await call.message.bot.send_message(cid, text)
+                sent += 1
+            except Exception:
                 try:
-                    await message.bot.send_photo(cid, photo=photo_file_id, caption=caption)
-                    sent += 1
+                    await drop_chat(cid)
                 except Exception:
+                    pass
+                failed += 1
+            # обновление прогресса не чаще раза в 0.5 сек
+            now_ts = time.monotonic()
+            if now_ts - last_edit_ts >= 0.5:
+                async with lock:
+                    last_edit_ts = time.monotonic()
+                    pct = (sent + failed) / total if total else 1.0
                     try:
-                        await drop_chat(cid)
-                    except Exception:
+                        await call.message.bot.edit_message_text(
+                            chat_id=status_msg.chat.id,
+                            message_id=status_msg.message_id,
+                            text=f"🚀 Старт рассылки (текст)\n{_progress_bar(pct)}\n{sent+failed} / {total}"
+                        )
+                    except TelegramBadRequest:
                         pass
-                    failed += 1
-                await asyncio.sleep(BROADCAST_DELAY_SEC)
+            await asyncio.sleep(BROADCAST_DELAY_SEC)
 
-        await asyncio.gather(*(worker(cid) for cid in chat_ids))
-        await message.answer(f"✅ Рассылка (фото) завершена.\nВсего: {total}\nОтправлено: {sent}\nОшибок/очищено: {failed}", reply_markup=ADMIN_KB)
+    await asyncio.gather(*(worker(cid) for cid in chat_ids))
 
-    asyncio.create_task(do_broadcast_photo())
+    # финальный отчёт
+    try:
+        await call.message.bot.edit_message_text(
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+            text=f"✅ Рассылка завершена.\nВсего: {total}\nОтправлено: {sent}\nОшибок/очищено: {failed}"
+        )
+    except TelegramBadRequest:
+        await call.message.answer(f"✅ Рассылка завершена.\nВсего: {total}\nОтправлено: {sent}\nОшибок/очищено: {failed}")
+    await call.message.answer("Готово. Возвращаю админ-меню.", reply_markup=ADMIN_KB)
+    await call.answer()
+
+@router.callback_query(F.data == "bcast_confirm_photo")
+async def bcast_confirm_photo(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Нет доступа")
+    data = await state.get_data()
+    if data.get("kind") != "photo":
+        return await call.answer("Нет данных для рассылки", show_alert=True)
+
+    photo_file_id: str = data["photo_file_id"]
+    caption: Optional[str] = data.get("caption")
+    chat_ids: List[int] = data["audience"]
+    await state.clear()
+
+    total = len(chat_ids)
+    sent = 0
+    failed = 0
+    status_msg = await call.message.edit_text(f"🚀 Старт рассылки (фото)\n{_progress_bar(0)}\n0 / {total}")
+    lock = asyncio.Lock()
+
+    sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+    last_edit_ts = time.monotonic()
+
+    async def worker(cid: int):
+        nonlocal sent, failed, last_edit_ts
+        async with sem:
+            try:
+                await call.message.bot.send_photo(cid, photo=photo_file_id, caption=caption)
+                sent += 1
+            except Exception:
+                try:
+                    await drop_chat(cid)
+                except Exception:
+                    pass
+                failed += 1
+            now_ts = time.monotonic()
+            if now_ts - last_edit_ts >= 0.5:
+                async with lock:
+                    last_edit_ts = time.monotonic()
+                    pct = (sent + failed) / total if total else 1.0
+                    try:
+                        await call.message.bot.edit_message_text(
+                            chat_id=status_msg.chat.id,
+                            message_id=status_msg.message_id,
+                            text=f"🚀 Старт рассылки (фото)\n{_progress_bar(pct)}\n{sent+failed} / {total}"
+                        )
+                    except TelegramBadRequest:
+                        pass
+            await asyncio.sleep(BROADCAST_DELAY_SEC)
+
+    await asyncio.gather(*(worker(cid) for cid in chat_ids))
+
+    # финальный отчёт
+    try:
+        await call.message.bot.edit_message_text(
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+            text=f"✅ Рассылка (фото) завершена.\nВсего: {total}\nОтправлено: {sent}\nОшибок/очищено: {failed}"
+        )
+    except TelegramBadRequest:
+        await call.message.answer(f"✅ Рассылка (фото) завершена.\nВсего: {total}\nОтправлено: {sent}\nОшибок/очищено: {failed}")
+    await call.message.answer("Готово. Возвращаю админ-меню.", reply_markup=ADMIN_KB)
+    await call.answer()
+
+@router.message(Text(equals="📊 Кол-во подписчиков"))
+async def admin_count(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    chat_ids = await get_all_chat_ids(optin_only=True)
+    await message.answer(f"Всего подписчиков (optin=True): {len(chat_ids)}", reply_markup=ADMIN_KB)
 
 @router.message(Command("cancel"))
 async def admin_cancel(message: Message, state: FSMContext):
