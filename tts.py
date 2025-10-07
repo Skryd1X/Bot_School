@@ -30,6 +30,28 @@ if not OPENAI_API_KEY:
 
 _client: AsyncOpenAI | None = None
 
+# Допустимые голоса и алиасы (устаревшие/пользовательские имена → валидные)
+_ALLOWED_VOICES = {
+    "nova", "shimmer", "echo", "onyx", "fable", "alloy", "ash", "sage", "coral"
+}
+_VOICE_ALIASES = {
+    "aria": "alloy",
+    "verse": "alloy",
+    "v2": "alloy",
+    "default": "alloy",
+}
+
+def _pick_voice(name: Optional[str]) -> str:
+    if not name:
+        return "alloy"
+    n = str(name).strip().lower()
+    if n in _ALLOWED_VOICES:
+        return n
+    if n in _VOICE_ALIASES:
+        return _VOICE_ALIASES[n]
+    # неизвестные значения не валим в ошибку — подменяем на alloy
+    return "alloy"
+
 
 def _client_lazy() -> AsyncOpenAI:
     global _client
@@ -136,7 +158,7 @@ async def tts_bytes(
     if not text or not text.strip():
         raise ValueError("tts: empty text")
 
-    voice = voice or TTS_DEFAULT_VOICE
+    voice = _pick_voice(voice or TTS_DEFAULT_VOICE)
     fmt   = (fmt or TTS_DEFAULT_FORMAT).lower()
     model = model or OPENAI_TTS_MODEL
     speed = _clamp_speed(speed)
@@ -147,7 +169,7 @@ async def tts_bytes(
 
     # Основной путь — современный TTS (SDK >= 1.99.x)
     try:
-        kwargs = dict(model=model, voice=voice, input=text_or_ssml, response_format=fmt)
+        kwargs = dict(model=model, voice=voice, input=text_or_ssml, format=fmt)
         # Если мы не использовали SSML, но скорость задана, попробуем (молчаливо) передать как vendor-hint.
         if (speed and not wants_ssml):
             kwargs["speed"] = speed  # если эндпоинт не знает — свалимся в TypeError
@@ -168,7 +190,7 @@ async def tts_bytes(
 
     except TypeError as e:
         # Случай несовпадения сигнатуры — повтор без «экзотики»
-        log.warning("TTS primary failed (%s). Retrying w/o speed/response_format extras…", e)
+        log.warning("TTS primary failed (%s). Retrying w/o speed/format extras…", e)
         async with client.audio.speech.with_streaming_response.create(
             model=model,
             voice=voice,
@@ -190,7 +212,7 @@ async def tts_bytes(
             model=OPENAI_TTS_FALLBACK,
             voice=voice,
             input=text,         # на фоллбэке без SSML надёжнее
-            response_format="mp3",
+            format="mp3",
         ) as resp:
             buf = BytesIO()
             async for chunk in resp.iter_bytes():
