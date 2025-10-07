@@ -1,17 +1,28 @@
 aiogram==3.21.0
 openai==1.99.9
-aiohttp==3.12.15
-aiofiles==24.1.0
-magic-filter==1.0.12
-anyio==4.10.0
+
+# HTTP / ASGI
+fastapi==0.115.4
+uvicorn[standard]==0.30.3
 httpx==0.28.1
+anyio==4.10.0
 h11==0.16.0
-idna==3.10
+sniffio==1.3.1
+
+# Telegram deps
+aiohttp==3.12.15
+magic-filter==1.0.12
 yarl==1.20.1
 attrs==25.3.0
 frozenlist==1.7.0
 aiosignal==1.4.0
-sniffio==1.3.1
+
+# Mongo
+motor==3.6.0
+pymongo==4.9.1
+
+# Utils
+python-dotenv==1.0.1
 tqdm==4.67.1
 distro==1.9.0
 typing_extensions==4.14.1
@@ -20,11 +31,10 @@ pydantic_core==2.33.2
 jiter==0.10.0
 propcache==0.3.2
 typing-inspection==0.4.1
-motor==3.6.0
-python-dotenv==1.0.1
-fastapi==0.115.4
-uvicorn[standard]==0.30.3
-pymongo==4.9.1
-openai>=1.40.0
-pydub>=0.25.1
-reportlab>=4.2.0
+
+# Медиа/генерация
+pydub>=0.25.1      # для постобработки звука (нужен системный ffmpeg)
+reportlab>=4.2.0   # экспорт PDF
+
+# опционально (иногда полезно для форм-аплоадов, если появятся)
+# python-multipart>=0.0.9

@@ -1,7 +1,7 @@
 # generators.py
 import os
 import base64
-from typing import AsyncIterator, List, Dict, Any
+from typing import AsyncIterator, List, Dict, Any, Literal, Tuple, Optional
 
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -54,45 +54,200 @@ ENGINEERING_RULES = (
 ENGINEERING_KEYWORDS = {
     "балка","ферма","опора","шарнир","защемление","реакция","реакции",
     "кн","кн/м","н/м","кн*м","кн·м","момент","изгибающий","поперечная сила",
-    "диаграмма","q(","q=","F=","M=","EI","сопромат","статик","МС","прочность"
+    "диаграмма","q(","q=","f=","m=","ei","сопромат","статик","мс","прочность"
 }
 
 def _needs_engineering_mode(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in ENGINEERING_KEYWORDS)
 
-def _build_messages(user_text: str, history: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+# ---------- Профили/шаблоны ----------
+AnswerTemplate = Literal["default", "conspect", "ege", "code_skeleton", "essay_outline"]
+
+TEMPLATES: Dict[AnswerTemplate, str] = {
+    "default": "",
+    "conspect": (
+        "Сформируй КОНСПЕКТ: блоки — Введение, Определения/формулы, Ключевые идеи, "
+        "Примеры (минимум 2), Итог. Маркдауны и списки, без воды."
+    ),
+    "ege": (
+        "Сделай РАЗБОР в стиле ЕГЭ: Условие (кратко), Что требуется, Решение по шагам, "
+        "Проверка, Ответ. Если есть формулы — пиши словами и символами ASCII, без LaTeX."
+    ),
+    "code_skeleton": (
+        "Выдай СКЕЛЕТ КОДА: краткий план функций/классов, заготовки, комментарии-шаблоны, "
+        "минимальные тесты. Язык выбрать по контексту запроса."
+    ),
+    "essay_outline": (
+        "Выдай ПЛАН РЕФЕРАТА/ЭССЕ: Тезисы, аргументы, источники (общие), "
+        "структура: Введение — Основные разделы — Заключение."
+    ),
+}
+
+TEACHER_MODE = (
+    "Поясни максимально ПРОСТО, как учитель. Структура: 1) Интуиция/аналогия; "
+    "2) Пошаговое решение; 3) Типичные ошибки; 4) Мини-проверка (3 коротких вопроса с ответами в конце блока)."
+)
+
+def style_to_template(style: str | None) -> AnswerTemplate:
+    """
+    Мэппинг пользовательского стиля из prefs.answer_style -> наш шаблон.
+    """
+    s = (style or "").lower()
+    if s in {"conspect", "outline"}:
+        return "conspect"
+    if s in {"ege", "exam"}:
+        return "ege"
+    if s in {"code", "code_skeleton"}:
+        return "code_skeleton"
+    if s in {"essay", "essay_outline", "report"}:
+        return "essay_outline"
+    return "default"
+
+# ---------- Сборка messages ----------
+def _build_messages(
+    user_text: str,
+    history: List[Dict[str, str]],
+    template: AnswerTemplate = "default",
+    teacher_mode: bool = False,
+) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_SCHOOL},
         {"role": "system", "content": SCHOOL_FORMAT_NOTE},
     ]
     if _needs_engineering_mode(user_text):
         messages.append({"role": "system", "content": ENGINEERING_RULES})
-        # для инженерных задач делаем модель «построже»
+    if template != "default":
+        messages.append({"role": "system", "content": TEMPLATES[template]})
+    if teacher_mode:
+        messages.append({"role": "system", "content": TEACHER_MODE})
+
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     return messages
 
-async def stream_chat(messages: List[Dict[str, Any]], temperature: float = 0.4) -> AsyncIterator[str]:
+# ---------- Базовые генераторы ----------
+async def stream_chat(
+    messages: List[Dict[str, Any]],
+    temperature: float = 0.4,
+    priority: bool = False,
+) -> AsyncIterator[str]:
+    """
+    priority=True — мягкий флаг для PRO: пробрасываем заголовок/метаданные.
+    Сам по себе он не ускоряет API, но полезен для нашего роутинга/логирования.
+    """
+    extra = {}
+    if priority:
+        # безопасные «хинты» для собственного балансировщика/проксей
+        extra = {"extra_headers": {"X-Queue": "priority", "X-Tier": "pro"},
+                 "metadata": {"queue": "priority", "tier": "pro"}}
+
     stream = await client.chat.completions.create(
         model=TEXT_MODEL,
         messages=messages,
         temperature=temperature,
         stream=True,
+        **extra,
     )
     async for chunk in stream:
         delta = (chunk.choices[0].delta.content or "")
         if delta:
             yield delta
 
-async def stream_response_text(user_text: str, history: List[Dict[str, str]]) -> AsyncIterator[str]:
+async def stream_response_text(
+    user_text: str,
+    history: List[Dict[str, str]],
+    *,
+    template: AnswerTemplate = "default",
+    teacher_mode: bool = False,
+    priority: bool = False,
+) -> AsyncIterator[str]:
     # Если инженерная задача — жёстче зажимаем температуру
     temp = 0.15 if _needs_engineering_mode(user_text) else 0.4
-    messages = _build_messages(user_text, history)
-    async for delta in stream_chat(messages, temperature=temp):
+    messages = _build_messages(user_text, history, template=template, teacher_mode=teacher_mode)
+    async for delta in stream_chat(messages, temperature=temp, priority=priority):
         yield delta
 
+# Нестрриминговая версия с шаблоном/«учителем»
+async def generate_text(
+    user_text: str,
+    history: List[Dict[str, str]],
+    template: AnswerTemplate = "default",
+    teacher_mode: bool = False,
+    temperature: Optional[float] = None,
+    priority: bool = False,
+) -> str:
+    if temperature is None:
+        temperature = 0.15 if _needs_engineering_mode(user_text) else 0.4
+    messages = _build_messages(user_text, history, template=template, teacher_mode=teacher_mode)
+
+    extra = {}
+    if priority:
+        extra = {"extra_headers": {"X-Queue": "priority", "X-Tier": "pro"},
+                 "metadata": {"queue": "priority", "tier": "pro"}}
+
+    resp = await client.chat.completions.create(
+        model=TEXT_MODEL,
+        messages=messages,
+        temperature=temperature,
+        **extra,
+    )
+    return resp.choices[0].message.content or ""
+
+# ---------- «Учитель объясняет» ----------
+async def teacher_explain(user_text: str, history: List[Dict[str, str]], *, priority: bool = False) -> str:
+    return await generate_text(user_text, history, template="default", teacher_mode=True, temperature=0.2, priority=priority)
+
+# ---------- Шаблоны (конспект/ЕГЭ/код/эссе) ----------
+async def generate_by_template(
+    user_text: str,
+    history: List[Dict[str, str]],
+    template: AnswerTemplate,
+    *,
+    priority: bool = False,
+) -> str:
+    return await generate_text(user_text, history, template=template, teacher_mode=False, priority=priority)
+
+# ---------- Mini-quiz по уже сгенерированному ответу ----------
+# Возвращает (markdown, сырой JSON со структурой)
+async def quiz_from_answer(answer_text: str, n_questions: int = 4) -> Tuple[str, Dict[str, Any]]:
+    """
+    Синтезирует короткий тест (A/B/C/D) на основе разборa.
+    Возвращает (markdown, data) — удобно и для кнопок, и для простого вывода.
+    """
+    system = (
+        "Ты формируешь мини-тест по присланному объяснению. Строго проверяй соответствие фактам из текста."
+    )
+    user = (
+        f"Сделай {n_questions} вопрос(а) множественного выбора по материалу ниже. "
+        "На каждый вопрос — ровно 4 варианта (A–D), один правильный. "
+        "Сначала дай JSON со структурой: "
+        "{'questions':[{'q':'...','options':['A','B','C','D'],'correct':'A','why':'краткое объяснение'}]} "
+        "Затем на новой строке выведи markdown-версию для Telegram c пронумерованными вопросами и вариантами."
+        "\n\n=== Исходный разбор ===\n" + (answer_text or "")
+    )
+    resp = await client.chat.completions.create(
+        model=TEXT_MODEL,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        temperature=0.2,
+    )
+    raw = resp.choices[0].message.content or ""
+    # Пытаемся аккуратно отделить JSON от markdown (ожидаем, что JSON идёт первым)
+    import json, re
+    json_obj: Dict[str, Any] = {"questions":[]}
+    md = raw
+    m = re.search(r"\{.*\}\s*", raw, re.DOTALL)
+    if m:
+        json_str = m.group(0)
+        try:
+            json_obj = json.loads(json_str.replace("'", '"'))
+        except Exception:
+            pass
+        md = raw[m.end():].strip()
+    return md, json_obj
+
+# ---------- Картинки ----------
 async def solve_from_image(image_bytes: bytes, hint: str, history: List[Dict[str, str]]) -> str:
     data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("utf-8")
 

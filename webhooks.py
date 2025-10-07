@@ -15,7 +15,8 @@ from aiogram.types import Update
 from aiogram.client.session.aiohttp import AiohttpSession
 
 from db import set_subscription, db
-from handlers import router as handlers_router
+# ▼ рефералка: импортируем хук подсчёта/награды
+from db import process_referral_reward_if_needed
 
 log = logging.getLogger("webhooks")
 
@@ -241,10 +242,29 @@ async def tribute_webhook(request: Request):
     else:
         return _ok({"ignored": "unknown_startapp", "startapp": startapp})
 
+    # 7) зафиксировали оплату
     if event_id:
         await payments.update_one(
             {"_id": str(event_id)},
             {"$set": {"processed_at": True, "plan": plan, "days": SUBSCRIPTION_DAYS}}
         )
+
+    # 8) рефералка: засчитать платёж и, если настало — выдать награду
+    try:
+        rewarded, paid_count, referrer_id = await process_referral_reward_if_needed(chat_id)
+        # уведомления (если включены)
+        if referrer_id:
+            if rewarded:
+                await _notify_user(
+                    referrer_id,
+                    f"🎉 Ваш {paid_count}-й платящий друг оформил подписку — месяц PRO начислен автоматически!"
+                )
+            else:
+                await _notify_user(
+                    referrer_id,
+                    f"🙌 По вашей ссылке очередная покупка! Зачтено платящих: {paid_count}."
+                )
+    except Exception as e:
+        log.warning("referral reward processing failed for buyer %s: %s", chat_id, e)
 
     return _ok({"plan": plan, "days": SUBSCRIPTION_DAYS, "chat_id": chat_id})
