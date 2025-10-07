@@ -21,6 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.enums import ChatAction, ParseMode
+from aiogram.utils.keyboard import InlineKeyboardBuilder  # <- для кнопок теста
 
 from generators import stream_response_text, solve_from_image, quiz_from_answer
 from db import (
@@ -130,6 +131,12 @@ SETTINGS_KB = ReplyKeyboardMarkup(
 # ---------- Рейтконтроль ----------
 _last_send_ts: Dict[int, float] = {}
 _next_allowed_by_chat: Dict[int, float] = {}
+
+# антиспам-лок для PDF
+_export_lock: Dict[int, float] = {}
+
+# состояние мини-теста в памяти
+QUIZ_STATE: Dict[int, Dict] = {}
 
 # ------------- helpers -------------
 async def _is_pro(chat_id: int) -> bool:
@@ -975,15 +982,30 @@ async def cb_tts_say(call: CallbackQuery):
         except Exception:
             pass
 
+# ======= PDF (анти-спам и возврат клавиатуры) =======
 @router.callback_query(F.data == "export_pdf")
 async def cb_export_pdf(call: CallbackQuery):
     chat_id = call.message.chat.id
     if not await _is_pro(chat_id):
         return await call.answer("Экспорт PDF доступен только в PRO.", show_alert=True)
+
+    # антидубликаты (6 сек)
+    now = time.monotonic()
+    if _export_lock.get(chat_id, 0.0) > now:
+        return await call.answer("Уже экспортирую…", show_alert=False)
+    _export_lock[chat_id] = now + 6.0
+
     answer = await _last_assistant_text(chat_id)
     if not answer:
-        await call.answer("Нет текста для экспорта", show_alert=True)
-        return
+        _export_lock.pop(chat_id, None)
+        return await call.answer("Нет текста для экспорта", show_alert=True)
+
+    # временно убираем клавиатуру, чтобы не кликали повторно
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
     try:
         pdf = pdf_from_answer_text(answer, title="Разбор задачи", author="Учебный помощник")
         bi = BufferedInputFile(pdf.getvalue(), filename="razbor.pdf")
@@ -991,6 +1013,22 @@ async def cb_export_pdf(call: CallbackQuery):
         await call.answer()
     except Exception as e:
         await call.answer(f"Ошибка экспорта: {e}", show_alert=True)
+    finally:
+        _export_lock.pop(chat_id, None)
+        # вернуть клавиатуру действий
+        try:
+            is_pro = await _is_pro(chat_id)
+            await call.message.edit_reply_markup(reply_markup=answer_actions_kb(is_pro))
+        except Exception:
+            pass
+
+# ======= Мини-тест с кнопками A/B/C/D =======
+def _quiz_kb(qi: dict, q_index: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    options = (qi.get("options") or [])[:4]
+    for i, opt in enumerate(options):
+        kb.button(text=f"{chr(65+i)}) {opt}", callback_data=f"quiz_answer:{q_index}:{i}")
+    return kb.as_markup()
 
 @router.callback_query(F.data == "quiz_make")
 async def cb_quiz_make(call: CallbackQuery):
@@ -1005,12 +1043,55 @@ async def cb_quiz_make(call: CallbackQuery):
     await call.answer("Готовлю мини-тест…", show_alert=False)
     try:
         md, data = await quiz_from_answer(answer, n_questions=4)
-        # просто отправляем markdown версию
-        await call.message.answer(f"🧠 Мини-тест\n\n{md}")
+        items = (data or {}).get("questions") or []
+        if not items:
+            # fallback: отправим хотя бы md-версию
+            return await call.message.answer(f"🧠 Мини-тест\n\n{md}")
+
+        QUIZ_STATE[chat_id] = {"idx": 0, "items": items}
+        q0 = items[0]
+        text = f"🧠 Мини-тест\n\nВопрос 1/{len(items)}:\n{q0.get('q','')}"
+        await call.message.answer(text, reply_markup=_quiz_kb(q0, 0))
     except Exception as e:
         await call.message.answer(f"❌ Не удалось построить тест: {e}")
 
-# Апселл-замочки
+@router.callback_query(F.data.startswith("quiz_answer:"))
+async def cb_quiz_answer(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    try:
+        _, q_index_str, opt_idx_str = call.data.split(":")
+        q_idx = int(q_index_str); opt_idx = int(opt_idx_str)
+        state = QUIZ_STATE.get(chat_id)
+        if not state:
+            return await call.answer("Тест не найден.", show_alert=True)
+
+        items = state["items"]
+        if q_idx >= len(items):
+            return await call.answer("Вопрос не найден.", show_alert=True)
+
+        qi = items[q_idx]
+        correct_letter = (qi.get("correct") or "A").strip().upper()
+        correct_idx = "ABCD".find(correct_letter)
+        if correct_idx < 0:
+            correct_idx = 0
+
+        ok = (opt_idx == correct_idx)
+        await call.answer("Верно! ✅" if ok else f"Неверно. ❌ Правильный ответ: {correct_letter}", show_alert=False)
+
+        # следующий вопрос или итог
+        next_idx = q_idx + 1
+        if next_idx < len(items):
+            state["idx"] = next_idx
+            qn = items[next_idx]
+            await call.message.answer(f"Вопрос {next_idx+1}/{len(items)}:\n{qn.get('q','')}",
+                                      reply_markup=_quiz_kb(qn, next_idx))
+        else:
+            QUIZ_STATE.pop(chat_id, None)
+            await call.message.answer("Готово! Хочешь ещё раз — жми «🧠 Проверить себя».")
+    except Exception:
+        await call.answer("Ошибка обработки ответа.", show_alert=True)
+
+# ---------- Апселл-замочки ----------
 @router.callback_query(F.data.in_(("need_pro_pdf","need_pro_quiz")))
 async def cb_need_pro(call: CallbackQuery):
     await call.answer("Функция доступна только в PRO.", show_alert=True)

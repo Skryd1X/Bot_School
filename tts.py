@@ -20,7 +20,8 @@ OPENAI_BASE_URL      = os.getenv("OPENAI_BASE_URL") or None
 OPENAI_TTS_MODEL     = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")  # основной
 OPENAI_TTS_FALLBACK  = os.getenv("OPENAI_TTS_FALLBACK", "tts-1")         # фолбэк
 TTS_DEFAULT_VOICE    = os.getenv("TTS_VOICE", "alloy")
-TTS_DEFAULT_FORMAT   = os.getenv("TTS_FORMAT", "opus")  # "opus" (OGG/voice), "mp3", "wav"
+# ВАЖНО: для совместимости с API формат по умолчанию делаем ogg (Opus в контейнере OGG)
+TTS_DEFAULT_FORMAT   = os.getenv("TTS_FORMAT", "ogg")  # "ogg"(voice), "mp3", "wav"
 TTS_USE_SSML         = os.getenv("TTS_USE_SSML", "false").lower() == "true"  # если модель понимает SSML
 TTS_SPEED_MIN        = float(os.getenv("TTS_SPEED_MIN", "0.7"))
 TTS_SPEED_MAX        = float(os.getenv("TTS_SPEED_MAX", "1.4"))
@@ -152,7 +153,7 @@ async def tts_bytes(
 ) -> Tuple[bytes, str, str]:
     """
     Возвращает (audio_bytes, mime, ext).
-    fmt: "opus" для voice (OGG/Opus) или "mp3"/"wav" для send_audio.
+    fmt: "ogg" для voice (OGG/Opus) или "mp3"/"wav" для send_audio.
     speed: 0.7..1.4 (мягкая коррекция; если недоступно — игнорируется).
     """
     if not text or not text.strip():
@@ -163,13 +164,16 @@ async def tts_bytes(
     model = model or OPENAI_TTS_MODEL
     speed = _clamp_speed(speed)
 
+    # ВАЖНО: если прилетело "opus", для API это должен быть "ogg"
+    api_fmt = "ogg" if fmt in {"opus", "ogg"} else fmt
+
     client = _client_lazy()
     text_or_ssml = _wrap_ssml(text, speed)
     wants_ssml = text_or_ssml != text
 
     # Основной путь — современный TTS (SDK >= 1.99.x)
     try:
-        kwargs = dict(model=model, voice=voice, input=text_or_ssml, format=fmt)
+        kwargs = dict(model=model, voice=voice, input=text_or_ssml, format=api_fmt)
         # Если мы не использовали SSML, но скорость задана, попробуем (молчаливо) передать как vendor-hint.
         if (speed and not wants_ssml):
             kwargs["speed"] = speed  # если эндпоинт не знает — свалимся в TypeError
@@ -181,11 +185,11 @@ async def tts_bytes(
             audio = buf.getvalue()
 
         # Пост-процесс скорости (если задана и нет SSML)
-        _, ext = _mime_ext(fmt)
+        _, ext_for_post = _mime_ext(api_fmt)
         if speed and not wants_ssml:
-            audio = _maybe_speed_postprocess(audio, ext, speed)
+            audio = _maybe_speed_postprocess(audio, ext_for_post, speed)
 
-        mime, ext = _mime_ext(fmt)
+        mime, ext = _mime_ext(api_fmt)
         return audio, mime, ext
 
     except TypeError as e:
@@ -227,7 +231,8 @@ async def tts_voice_ogg(text: str, voice: str | None = None, speed: Optional[flo
     """
     Готовит файл для Telegram voice: .ogg (Opus).
     """
-    audio, _, ext = await tts_bytes(text, voice=voice, fmt="opus", speed=speed)
+    # просим ogg (совместимо с API), а не «opus»
+    audio, _, ext = await tts_bytes(text, voice=voice, fmt="ogg", speed=speed)
     bio = BytesIO(audio)
     bio.name = f"voice.{ext}"
     bio.seek(0)

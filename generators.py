@@ -135,14 +135,13 @@ async def stream_chat(
     priority: bool = False,
 ) -> AsyncIterator[str]:
     """
-    priority=True — мягкий флаг для PRO: пробрасываем заголовок/метаданные.
+    priority=True — мягкий флаг для PRO: пробрасываем заголовок.
     Сам по себе он не ускоряет API, но полезен для нашего роутинга/логирования.
     """
-    extra = {}
+    extra: Dict[str, Any] = {}
     if priority:
         # безопасные «хинты» для собственного балансировщика/проксей
-        extra = {"extra_headers": {"X-Queue": "priority", "X-Tier": "pro"},
-                 "metadata": {"queue": "priority", "tier": "pro"}}
+        extra = {"extra_headers": {"X-Queue": "priority", "X-Tier": "pro"}}
 
     stream = await client.chat.completions.create(
         model=TEXT_MODEL,
@@ -183,10 +182,9 @@ async def generate_text(
         temperature = 0.15 if _needs_engineering_mode(user_text) else 0.4
     messages = _build_messages(user_text, history, template=template, teacher_mode=teacher_mode)
 
-    extra = {}
+    extra: Dict[str, Any] = {}
     if priority:
-        extra = {"extra_headers": {"X-Queue": "priority", "X-Tier": "pro"},
-                 "metadata": {"queue": "priority", "tier": "pro"}}
+        extra = {"extra_headers": {"X-Queue": "priority", "X-Tier": "pro"}}
 
     resp = await client.chat.completions.create(
         model=TEXT_MODEL,
@@ -238,7 +236,7 @@ async def quiz_from_answer(answer_text: str, n_questions: int = 4) -> Tuple[str,
     import json, re
     json_obj: Dict[str, Any] = {"questions":[]}
     md = raw
-    m = re.search(r"\{.*\}\s*", raw, re.DOTALL)
+    m = re.search(r"\{.*\}\s*", raw, re.DotAll)
     if m:
         json_str = m.group(0)
         try:
