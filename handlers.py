@@ -11,20 +11,23 @@ from aiogram.types import (
     CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardRemove,  # --- added admin ---
+    ReplyKeyboardRemove,
+    BufferedInputFile,                    # важно для отправки voice из памяти
 )
 from aiogram.filters import CommandStart, StateFilter, Command
-# from aiogram.filters import Text  # --- removed, not in aiogram 3.x ---
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State  # --- added admin ---
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.enums import ChatAction
 
 from generators import stream_response_text, solve_from_image
 from db import (
     ensure_user, can_use, inc_usage, get_status_text,
-    get_all_chat_ids, drop_chat, set_optin, set_optin_for_all  # ← добавили
+    get_all_chat_ids, drop_chat, set_optin
 )
+
+# --- TTS (озвучка) ---
+from tts import tts_voice_ogg, split_for_tts
 
 router = Router()
 
@@ -39,6 +42,10 @@ TRIBUTE_LITE_STARTAPP = os.getenv("TRIBUTE_LITE_STARTAPP", "")
 TRIBUTE_PRO_STARTAPP  = os.getenv("TRIBUTE_PRO_STARTAPP", "")
 TRIBUTE_LITE_PRICE    = os.getenv("TRIBUTE_LITE_PRICE", "200")
 TRIBUTE_PRO_PRICE     = os.getenv("TRIBUTE_PRO_PRICE", "300")
+
+# Параметры TTS
+TTS_ENABLED_DEFAULT_PRO = True
+TTS_CHUNK_LIMIT = 2500
 
 def tribute_url(code: str) -> str:
     return f"https://t.me/tribute/app?startapp={code}"
@@ -60,11 +67,18 @@ def available_btn_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[[InlineKeyboardButton(text="📦 Доступные пакеты", callback_data="show_plans")]]
     )
 
+# Кнопка «Озвучить»
+def tts_btn_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🎙 Озвучить ответ", callback_data="tts_say")]]
+    )
+
 # Постоянная нижняя Reply-клавиатура
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🧾 Мои подписки"), KeyboardButton(text="🧹 Сброс")],
-        [KeyboardButton(text="FAQ / Помощь")],  # ← добавлено
+        [KeyboardButton(text="FAQ / Помощь")],
+        [KeyboardButton(text="🎙 Озвучка ВКЛ/ВЫКЛ")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -76,11 +90,27 @@ _last_send_ts: Dict[int, float] = {}
 _next_allowed_by_chat: Dict[int, float] = {}
 HISTORY: Dict[int, List[Dict[str, str]]] = {}  # chat_id -> [{role, content}...]
 
+# флаг авто-озвучки для PRO (в ОЗУ)
+VOICE_AUTO: set[int] = set()
+
 def _remember(chat_id: int, role: str, content: str):
     hist = HISTORY.setdefault(chat_id, [])
     hist.append({"role": role, "content": content})
     if len(hist) > MAX_TURNS * 2:
-        HISTORY[chat_id] = hist[-MAX_TURNS * 2 :]
+        HISTORY[chat_id] = hist[-MAX_TURNS * 2:]
+
+# ------------- helpers -------------
+async def _is_pro(chat_id: int) -> bool:
+    """Грубая эвристика по get_status_text."""
+    text = await get_status_text(chat_id)
+    return "план: pro" in text.lower()
+
+def _last_assistant_text(chat_id: int) -> Optional[str]:
+    items = HISTORY.get(chat_id) or []
+    for item in reversed(items):
+        if item.get("role") == "assistant":
+            return item.get("content") or ""
+    return None
 
 # ---------- Безопасные отправки/редактирования ----------
 async def _respect_rate_limit(chat_id: int):
@@ -100,7 +130,7 @@ async def safe_send(message: Message, text: str, **kwargs):
         await _respect_rate_limit(message.chat.id)
         return await message.answer(text, **kwargs)
     except TelegramBadRequest as e:
-        if "Too Many Requests" in str(e) or "Flood control exceeded" in str(e):
+        if "too many requests" in str(e).lower() or "flood control exceeded" in str(e).lower():
             await asyncio.sleep(2)
             await _respect_rate_limit(message.chat.id)
             return await message.answer(text, **kwargs)
@@ -165,21 +195,14 @@ async def send_long_text(message: Message, text: str):
 
 # ---------- Экран «Мои подписки» ----------
 async def show_subscriptions(message: Message):
-    """Показывает статус. Для LITE добавляет кнопку 'Доступные пакеты'. Для PRO — без кнопок.
-       Для FREE — сразу выводит меню покупки LITE/PRO."""
     text = await get_status_text(message.chat.id)
-
-    # Грубая эвристика по тексту статуса:
     low = text.lower()
     if "план: free" in low:
-        # FREE — предлагаем пакеты
         await message.answer(text, reply_markup=plans_kb(show_back=False))
     elif "план: lite" in low:
-        # LITE — показать апгрейд
         text2 = text + "\n\n⬆️ Доступно обновление до PRO для безлимита и приоритета."
         await message.answer(text2, reply_markup=available_btn_kb())
     else:
-        # PRO — просто статус
         await message.answer(text, reply_markup=MAIN_KB)
 
 # ---------- Команды/кнопки ----------
@@ -199,14 +222,15 @@ async def cmd_start(message: Message):
         "— Пришли фото задачи или напиши текстом, что нужно.\n"
         "— Нужна справка или условия — жми «FAQ / Помощь».\n"
         "— Статус доступа и пакеты — «🧾 Мои подписки».\n"
+        "— Голосовые ответы (только PRO): включай /voice_on.\n"
     )
 
-    # Приветствие + показать клавиатуру
     await message.answer(greeting, reply_markup=MAIN_KB)
 
-    # Сразу покажем экран подписок (он сам разрулит FREE/LITE/PRO)
-    await show_subscriptions(message)
+    if TTS_ENABLED_DEFAULT_PRO and await _is_pro(message.chat.id):
+        VOICE_AUTO.add(message.chat.id)
 
+    await show_subscriptions(message)
 
 @router.message(Command("plan"))
 async def cmd_plan(message: Message):
@@ -220,6 +244,39 @@ async def cmd_status(message: Message):
 async def cmd_reset(message: Message):
     HISTORY.pop(message.chat.id, None)
     await message.answer("🧹 Контекст очищен", reply_markup=MAIN_KB)
+
+# Озвучка — команды
+@router.message(Command("voice_on"))
+async def cmd_voice_on(message: Message):
+    if not await _is_pro(message.chat.id):
+        return await message.answer("🎙 Озвучка доступна только в PRO. Обновите план: /plan")
+    VOICE_AUTO.add(message.chat.id)
+    await message.answer("🎙 Озвучка ответов: ВКЛ. Буду присылать голос после текста.")
+
+@router.message(Command("voice_off"))
+async def cmd_voice_off(message: Message):
+    VOICE_AUTO.discard(message.chat.id)
+    await message.answer("🎙 Озвучка ответов: ВЫКЛ. Кнопка «Озвучить» останется под ответами.")
+
+@router.message(Command("speak"))
+async def cmd_speak(message: Message):
+    if not await _is_pro(message.chat.id):
+        return await message.answer("🎙 Озвучка доступна только в PRO. Обновите план: /plan")
+    text = _last_assistant_text(message.chat.id)
+    if not text:
+        return await message.answer("Нет последнего ответа для озвучки.")
+    await _send_tts_for_text(message, text)
+
+@router.message(F.text == "🎙 Озвучка ВКЛ/ВЫКЛ")
+async def kb_voice_toggle(message: Message):
+    if not await _is_pro(message.chat.id):
+        return await message.answer("🎙 Эта функция доступна только в PRO. Обновите план: /plan")
+    if message.chat.id in VOICE_AUTO:
+        VOICE_AUTO.discard(message.chat.id)
+        await message.answer("🔕 Авто-озвучка: ВЫКЛ.")
+    else:
+        VOICE_AUTO.add(message.chat.id)
+        await message.answer("🔔 Авто-озвучка: ВКЛ. Буду присылать voice после текста.")
 
 # Нажатия по нижней Reply-клавиатуре
 @router.message(F.text == "🧾 Мои подписки")
@@ -252,7 +309,8 @@ async def faq_how(message: Message):
         "📘 Как пользоваться ботом:\n\n"
         "1) Отправьте фото задачи → бот даст пошаговый разбор.\n"
         "2) Можно вводить текстом — бот тоже понимает.\n"
-        "3) Расширенные функции доступны после оплаты внутри бота."
+        "3) Расширенные функции доступны после оплаты внутри бота.\n"
+        "4) Голосовые ответы (PRO): /voice_on, /voice_off, /speak."
     )
 
 @router.message(F.text == "Частые вопросы")
@@ -302,7 +360,6 @@ async def faq_offer(message: Message):
         "7.2. Все возникающие вопросы, не урегулированные Соглашением, решаются в соответствии с действующим законодательством.\n"
         "7.3. Контакт для обращений: @gptEDU_support"
     )
-    # длинный текст аккуратно отправим кусками
     if len(offer_text) > MAX_TG_LEN:
         await send_long_text(message, offer_text)
     else:
@@ -313,8 +370,6 @@ async def faq_back(message: Message):
     await message.answer("Возврат в главное меню", reply_markup=MAIN_KB)
 
 # ---------- Admin panel: вход по секретному коду, рассылки ----------
-
-# Хранилище админов (до 2-х), доступ по секретному коду из .env
 import json
 from pathlib import Path
 
@@ -335,6 +390,7 @@ def _load_admins():
 
 def _save_admins():
     try:
+        # <-- здесь была лишняя закрывающая скобка
         ADMINS_FILE.write_text(json.dumps(sorted(list(ADMINS))), encoding="utf-8")
     except Exception:
         pass
@@ -384,7 +440,7 @@ async def admin_logout(message: Message):
     else:
         await message.answer("Вы не в админ-режиме.", reply_markup=MAIN_KB)
 
-# Подписка/отписка для пользователей (опционально; пригодится для рассылок)
+# Подписка/отписка для пользователей (для рассылок)
 @router.message(Command("unsubscribe"))
 async def cmd_unsub(message: Message):
     await set_optin(message.chat.id, False)
@@ -400,24 +456,22 @@ class AdminBroadcastStates(StatesGroup):
     waiting_for_text = State()
     waiting_for_photo = State()
     waiting_for_caption = State()
-    confirm = State()  # --- admin confirm/progress ---
+    confirm = State()
 
 BROADCAST_CONCURRENCY = 20
 BROADCAST_DELAY_SEC   = 0.03
 
 def _progress_bar(pct: float, width: int = 12) -> str:
-    """Вернёт строку прогресс-бара вида [██████----] 50%"""
     done = int(round(pct * width))
     return f"[{'█'*done}{'—'*(width-done)}] {int(pct*100)}%"
 
 def _confirm_kb(kind: str) -> InlineKeyboardMarkup:
-    """Клавиатура подтверждения: kind='text'|'photo'"""
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"bcast_confirm_{kind}"),
         InlineKeyboardButton(text="❌ Отменить",    callback_data="bcast_cancel"),
     ]])
 
-# ---------- РАССЫЛКА ТЕКСТОМ (с подтверждением и прогрессом) ----------
+# ---------- РАССЫЛКА ТЕКСТОМ ----------
 @router.message(F.text == "📢 Рассылка — текст")
 async def admin_broadcast_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -437,7 +491,6 @@ async def admin_broadcast_receive_text(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    # Посчитаем аудиторию и спросим подтверждение
     chat_ids = await get_all_chat_ids(optin_only=True)
     await state.update_data(kind="text", text=text, audience=chat_ids)
     await state.set_state(AdminBroadcastStates.confirm)
@@ -447,7 +500,7 @@ async def admin_broadcast_receive_text(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# ---------- РАССЫЛКА ФОТО (с подтверждением и прогрессом) ----------
+# ---------- РАССЫЛКА ФОТО ----------
 @router.message(F.text == "🖼️ Рассылка — фото")
 async def admin_broadcast_photo_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -474,7 +527,6 @@ async def admin_broadcast_photo_received(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    # Спросим подпись
     await state.update_data(photo_file_id=photo_file_id)
     await state.set_state(AdminBroadcastStates.waiting_for_caption)
     await message.answer("Пришлите подпись (или пустое сообщение, чтобы без подписи):", reply_markup=ReplyKeyboardRemove())
@@ -488,7 +540,6 @@ async def admin_broadcast_photo_caption(message: Message, state: FSMContext):
     photo_file_id = data.get("photo_file_id")
     caption = (message.text or "").strip() or None
 
-    # Посчитаем аудиторию и спросим подтверждение
     chat_ids = await get_all_chat_ids(optin_only=True)
     await state.update_data(kind="photo", photo_file_id=photo_file_id, caption=caption, audience=chat_ids)
     await state.set_state(AdminBroadcastStates.confirm)
@@ -520,7 +571,6 @@ async def bcast_confirm_text(call: CallbackQuery, state: FSMContext):
     chat_ids: List[int] = data["audience"]
     await state.clear()
 
-    # Статусное сообщение с прогресс-баром
     total = len(chat_ids)
     sent = 0
     failed = 0
@@ -542,7 +592,6 @@ async def bcast_confirm_text(call: CallbackQuery, state: FSMContext):
                 except Exception:
                     pass
                 failed += 1
-            # обновление прогресса не чаще раза в 0.5 сек
             now_ts = time.monotonic()
             if now_ts - last_edit_ts >= 0.5:
                 async with lock:
@@ -560,7 +609,6 @@ async def bcast_confirm_text(call: CallbackQuery, state: FSMContext):
 
     await asyncio.gather(*(worker(cid) for cid in chat_ids))
 
-    # финальный отчёт
     try:
         await call.message.bot.edit_message_text(
             chat_id=status_msg.chat.id,
@@ -623,7 +671,6 @@ async def bcast_confirm_photo(call: CallbackQuery, state: FSMContext):
 
     await asyncio.gather(*(worker(cid) for cid in chat_ids))
 
-    # финальный отчёт
     try:
         await call.message.bot.edit_message_text(
             chat_id=status_msg.chat.id,
@@ -655,7 +702,6 @@ async def cb_show_plans(call: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_subs")
 async def cb_back_to_subs(call: CallbackQuery):
-    # перерисуем статус в том же сообщении
     text = await get_status_text(call.message.chat.id)
     kb: Optional[InlineKeyboardMarkup] = None
     low = text.lower()
@@ -717,21 +763,32 @@ async def generate_answer(message: Message, state: FSMContext):
             accumulated += delta
             t = asyncio.get_event_loop().time()
             if t - last_edit >= MIN_EDIT_INTERVAL:
+                # Пока генерируем — правим драфт без кнопки
                 await safe_edit(message, draft.message_id, accumulated or "…")
                 last_edit = t
 
+        # Готово: отправим финал с кнопкой TTS, если PRO и текст влезает
+        pro = await _is_pro(chat_id)
         if accumulated:
             if len(accumulated) > MAX_TG_LEN:
                 await safe_delete(draft)
                 await send_long_text(message, accumulated)
+                if pro:
+                    await message.answer("🎙 Нужна озвучка последнего ответа? Нажми:",
+                                         reply_markup=tts_btn_kb())
             else:
-                await safe_edit(message, draft.message_id, accumulated)
+                kb = tts_btn_kb() if pro else None
+                await safe_edit(message, draft.message_id, accumulated, reply_markup=kb)
         else:
             await safe_edit(message, draft.message_id, "Пустой ответ 😕")
 
         _remember(chat_id, "user", user_text)
         _remember(chat_id, "assistant", accumulated or "")
         await inc_usage(chat_id, "text")
+
+        # Авто-озвучка для PRO (если включена)
+        if pro and chat_id in VOICE_AUTO and accumulated:
+            await _send_tts_for_text(message, accumulated)
 
     except Exception as e:
         await safe_edit(message, draft.message_id, f"❌ Ошибка: {e}")
@@ -776,18 +833,62 @@ async def on_photo(message: Message, state: FSMContext):
             history=HISTORY.get(chat_id, [])
         )
 
+        pro = await _is_pro(chat_id)
         if answer and len(answer) > MAX_TG_LEN:
             await safe_delete(draft)
             await send_long_text(message, answer)
+            if pro:
+                await message.answer("🎙 Озвучить этот разбор?", reply_markup=tts_btn_kb())
         else:
-            await safe_edit(message, draft.message_id, answer or "Не удалось распознать задачу.")
+            kb = tts_btn_kb() if (pro and answer) else None
+            await safe_edit(message, draft.message_id, answer or "Не удалось распознать задачу.", reply_markup=kb)
 
         _remember(chat_id, "user", "[Фото задачи]")
         _remember(chat_id, "assistant", answer or "")
         await inc_usage(chat_id, "photo")
 
+        if pro and chat_id in VOICE_AUTO and answer:
+            await _send_tts_for_text(message, answer)
+
     except Exception as e:
         await safe_edit(message, draft.message_id, f"❌ Ошибка по фото: {e}")
-
     finally:
         await state.clear()
+
+# ---------- TTS callbacks ----------
+@router.callback_query(F.data == "tts_say")
+async def cb_tts_say(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    if not await _is_pro(chat_id):
+        await call.answer("Доступно только в PRO", show_alert=True)
+        return
+    text = _last_assistant_text(chat_id)
+    if not text:
+        await call.answer("Нет текста для озвучки", show_alert=True)
+        return
+    await call.answer("Озвучиваю…", show_alert=False)
+    # отправим в чат голосовые
+    try:
+        await _send_tts_for_text(call.message, text)
+    except Exception as e:
+        try:
+            await call.message.answer(f"❌ Ошибка озвучки: {e}")
+        except Exception:
+            pass
+
+# ---------- Вспомогательное: отправить TTS по тексту ----------
+async def _send_tts_for_text(message: Message, text: str):
+    """Режем на части и шлём voice .ogg (Opus)."""
+    chunks = split_for_tts(text, max_chars=TTS_CHUNK_LIMIT)
+    for idx, chunk in enumerate(chunks, 1):
+        try:
+            # генерим ogg/opus в память
+            voice_bio = await tts_voice_ogg(chunk, voice=None)
+            # aiogram 3.x: нужен BufferedInputFile
+            file = BufferedInputFile(voice_bio.getvalue(), filename=voice_bio.name or "voice.ogg")
+            cap = f"🎙 Озвучка ({idx}/{len(chunks)})" if len(chunks) > 1 else "🎙 Озвучка"
+            await message.answer_voice(voice=file, caption=cap)
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            await message.answer(f"❌ Не удалось озвучить часть {idx}: {e}")
+            break

@@ -1,7 +1,7 @@
 # db.py
 import os
 import datetime as dt
-from typing import Optional, Literal, Tuple, List  # --- added/updated ---
+from typing import Optional, Literal, Tuple, List, Any, Dict
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
@@ -25,12 +25,13 @@ Plan = Literal["free", "lite", "pro"]
 FREE_TEXT_LIMIT  = 3
 FREE_PHOTO_LIMIT = 2
 
-# LITE (меняются в .env)
+# LITE (можно менять в .env)
 LITE_TEXT_LIMIT  = int(os.getenv("LITE_TEXT_LIMIT",  "300"))
 LITE_PHOTO_LIMIT = int(os.getenv("LITE_PHOTO_LIMIT", "120"))
 
 UNLIMITED = 10**12  # «бесконечность» для PRO
 
+# ---------- helpers (время/даты) ----------
 def _now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -55,24 +56,34 @@ def _to_aware_utc(value) -> Optional[dt.datetime]:
         return parsed.astimezone(dt.timezone.utc)
     return None
 
+# ---------- пользователи / регистрация ----------
 async def ensure_user(chat_id: int) -> dict:
-    """Возвращает (и создаёт при необходимости) документ пользователя; обнуляет счётчики при новом месяце.
-       Попутно нормализует sub_expires_at к tz-aware UTC, если раньше сохранилось naive.
-       Также добавляет/мигрирует поле optin для рассылок."""
+    """
+    Возвращает (и создаёт при необходимости) документ пользователя; обнуляет счётчики при новом месяце.
+    Попутно нормализует sub_expires_at к tz-aware UTC, если раньше сохранилось naive.
+    Также добавляет/мигрирует поле optin для рассылок. prefs — объект пользовательских настроек.
+    """
     now = _now_utc()
     doc = await users.find_one({"chat_id": chat_id})
     if doc:
-        # --- миграция optin: если поля нет, включаем подписку по умолчанию
+        # миграция: optin по умолчанию True
         if "optin" not in doc:
             await users.update_one({"chat_id": chat_id}, {"$set": {"optin": True}})
             doc["optin"] = True
-        # Миграция: нормализуем дату подписки к aware UTC
+
+        # миграция: prefs объект
+        if "prefs" not in doc or not isinstance(doc.get("prefs"), dict):
+            await users.update_one({"chat_id": chat_id}, {"$set": {"prefs": {}}})
+            doc["prefs"] = {}
+
+        # нормализация даты подписки
         raw_exp = doc.get("sub_expires_at")
         norm_exp = _to_aware_utc(raw_exp)
         if norm_exp != raw_exp:
             await users.update_one({"chat_id": chat_id}, {"$set": {"sub_expires_at": norm_exp}})
             doc["sub_expires_at"] = norm_exp
 
+        # сброс помесячных счётчиков
         month = _month_key(now)
         if doc.get("period_month") != month:
             await users.update_one(
@@ -84,6 +95,7 @@ async def ensure_user(chat_id: int) -> dict:
             doc["photo_used"] = 0
         return doc
 
+    # новый пользователь
     doc = {
         "chat_id": chat_id,
         "created_at": now,
@@ -93,10 +105,12 @@ async def ensure_user(chat_id: int) -> dict:
         "text_used": 0,
         "photo_used": 0,
         "optin": True,            # подписка на рассылки по умолчанию
+        "prefs": {},              # пользовательские настройки (например voice_auto, стиль и т.п.)
     }
     await users.insert_one(doc)
     return doc
 
+# ---------- подписки / лимиты ----------
 async def _is_subscription_active(doc: dict) -> bool:
     if doc.get("plan") in ("lite", "pro"):
         exp = _to_aware_utc(doc.get("sub_expires_at"))
@@ -166,8 +180,8 @@ async def inc_usage(chat_id: int, kind: Literal["text", "photo"]) -> None:
     field = "text_used" if kind == "text" else "photo_used"
     await users.update_one({"chat_id": chat_id}, {"$inc": {field: 1}})
 
-# --- управление подпиской ---
 async def set_subscription(chat_id: int, plan: Plan, days: int = 30) -> dict:
+    """Установить подписку (plan) на N дней вперёд (перезаписывает срок)."""
     now = _now_utc()
     exp = now + dt.timedelta(days=days)
     await users.update_one(
@@ -176,6 +190,16 @@ async def set_subscription(chat_id: int, plan: Plan, days: int = 30) -> dict:
         upsert=True,
     )
     return await users.find_one({"chat_id": chat_id})
+
+async def is_pro_active(chat_id: int) -> bool:
+    """Быстрая проверка: PRO и срок не истёк."""
+    doc = await ensure_user(chat_id)
+    return doc.get("plan") == "pro" and await _is_subscription_active(doc)
+
+async def is_lite_active(chat_id: int) -> bool:
+    """Быстрая проверка: LITE и срок не истёк."""
+    doc = await ensure_user(chat_id)
+    return doc.get("plan") == "lite" and await _is_subscription_active(doc)
 
 async def get_status_text(chat_id: int) -> str:
     doc = await ensure_user(chat_id)
@@ -192,7 +216,7 @@ async def get_status_text(chat_id: int) -> str:
                 f"Решения по фото: безлимит (использовано {pu})")
 
     if active and plan == "lite":
-        exp_s = exp.strftime("%Y-%m-%d %H:%М UTC")
+        exp_s = exp.strftime("%Y-%m-%d %H:%M UTC")
         return (f"📦 План: LITE (активен до {exp_s})\n"
                 f"Текстовые запросы: {tu}/{text_limit}\n"
                 f"Решения по фото: {pu}/{photo_limit}")
@@ -206,7 +230,6 @@ async def get_status_text(chat_id: int) -> str:
 # -------------------------------
 # Рассылки / подписки (optin)
 # -------------------------------
-
 async def set_optin(chat_id: int, optin: bool = True) -> None:
     """Включить/выключить подписку на рассылки для пользователя."""
     await users.update_one({"chat_id": chat_id}, {"$set": {"optin": optin}}, upsert=True)
@@ -231,3 +254,30 @@ async def get_all_chat_ids(optin_only: bool = True) -> List[int]:
 async def drop_chat(chat_id: int) -> None:
     """Удалить (или пометить) мёртвый чат из базы — например, если пользователь заблокировал бота."""
     await users.delete_one({"chat_id": chat_id})
+
+# -------------------------------
+# Пользовательские настройки (prefs)
+# -------------------------------
+async def get_prefs(chat_id: int) -> Dict[str, Any]:
+    """Вернёт объект prefs; если нет — пустой словарь."""
+    doc = await ensure_user(chat_id)
+    prefs = doc.get("prefs") or {}
+    if not isinstance(prefs, dict):
+        prefs = {}
+    return prefs
+
+async def set_pref(chat_id: int, key: str, value: Any) -> None:
+    """Установить prefs.<key> = value."""
+    await users.update_one({"chat_id": chat_id}, {"$set": {f"prefs.{key}": value}}, upsert=True)
+
+async def set_prefs(chat_id: int, updates: Dict[str, Any]) -> None:
+    """Массово обновить prefs по словарю."""
+    if not updates:
+        return
+    set_doc = {f"prefs.{k}": v for k, v in updates.items()}
+    await users.update_one({"chat_id": chat_id}, {"$set": set_doc}, upsert=True)
+
+async def get_pref_bool(chat_id: int, key: str, default: bool = False) -> bool:
+    prefs = await get_prefs(chat_id)
+    v = prefs.get(key, default)
+    return bool(v)
