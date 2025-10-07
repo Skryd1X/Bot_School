@@ -4,6 +4,7 @@ import asyncio
 import time
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -18,7 +19,7 @@ from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
-from aiogram.enums import ChatAction
+from aiogram.enums import ChatAction, ParseMode
 
 from generators import stream_response_text, solve_from_image
 from db import (
@@ -37,6 +38,7 @@ from db import (
     get_or_create_ref_code, get_referral_stats,
     find_user_by_ref_code, set_referrer_once,
 )
+
 from utils_export import pdf_from_answer_text
 from tts import tts_voice_ogg, split_for_tts
 
@@ -92,7 +94,6 @@ def answer_actions_kb(is_pro: bool) -> InlineKeyboardMarkup:
         rows[0].append(InlineKeyboardButton(text="📄 PDF", callback_data="export_pdf"))
         rows[0].append(InlineKeyboardButton(text="🧠 Проверить себя", callback_data="quiz_make"))
     else:
-        # «замочки» с апселлом
         rows[0].append(InlineKeyboardButton(text="🔒 PDF (PRO)", callback_data="need_pro_pdf"))
         rows[0].append(InlineKeyboardButton(text="🔒 Проверить себя (PRO)", callback_data="need_pro_quiz"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -153,6 +154,15 @@ def _ref_link_from_code(code: str) -> str:
     # https://t.me/<bot>?start=ref_<code>
     return f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
 
+def _share_button(link: str, caption: str) -> InlineKeyboardButton:
+    """
+    Системная страница шеринга Telegram:
+    https://t.me/share/url?url=<URL>&text=<TEXT>
+    Откроет диалог выбора чата и подставит ссылку+текст.
+    """
+    share_url = f"https://t.me/share/url?url={quote_plus(link)}&text={quote_plus(caption)}"
+    return InlineKeyboardButton(text="📤 Поделиться", url=share_url)
+
 async def _send_referral_card(message: Message):
     stats = await get_referral_stats(message.chat.id)
     code  = stats.get("ref_code") or await get_or_create_ref_code(message.chat.id)
@@ -164,21 +174,24 @@ async def _send_referral_card(message: Message):
     meter = "█"*progress + "—"*(REF_BONUS_THRESHOLD-progress)
 
     text = (
-        "🎁 Бонус за друзей\n\n"
+        "🎁 <b>Бонус за друзей</b>\n\n"
         f"Приглашай друзей по персональной ссылке.\n"
-        f"За каждые {REF_BONUS_THRESHOLD} покупок (LITE/PRO) по твоей ссылке — +1 месяц PRO.\n\n"
-        f"🔗 Твоя ссылка:\n{link}\n\n"
-        f"📊 Статистика:\n"
-        f"— Всего приглашено: {total}\n"
-        f"— Купили подписку: {paid}\n"
+        f"За каждые <b>{REF_BONUS_THRESHOLD}</b> покупок (LITE/PRO) по твоей ссылке — <b>+1 месяц PRO</b>.\n\n"
+        f"🔗 <b>Твоя ссылка:</b>\n<code>{link}</code>\n\n"
+        f"📊 <b>Статистика</b>\n"
+        f"— Всего приглашено: <b>{total}</b>\n"
+        f"— Купили подписку: <b>{paid}</b>\n"
         f"— Прогресс до подарка: [{meter}] {progress}/{REF_BONUS_THRESHOLD}\n"
-        f"— До следующего подарка: {left}\n\n"
+        f"— До следующего подарка: <b>{left}</b>\n\n"
         "Поделись ссылкой с одногруппниками, в чатах курса или друзьям 👇"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть ссылку", url=link)]
-    ])
-    await message.answer(text, reply_markup=kb)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔗 Открыть ссылку", url=link),
+        _share_button(link, "Помощник для учёбы — моя реф. ссылка:")
+    ]])
+
+    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 # ---------- Безопасные отправки/редактирования ----------
 async def _respect_rate_limit(chat_id: int):
@@ -466,8 +479,6 @@ FAQ_KB = ReplyKeyboardMarkup(
 async def faq_main(message: Message):
     await message.answer("Выберите раздел:", reply_markup=FAQ_KB)
 
-from aiogram.enums import ParseMode
-
 @router.message(F.text == "Как пользоваться ботом")
 async def faq_how(message: Message):
     text = (
@@ -485,7 +496,6 @@ async def faq_how(message: Message):
         "💡 <i>Совет:</i> если не хватает данных (чисел/условий), бот подскажет, что уточнить."
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
-
 
 @router.message(F.text == "Частые вопросы")
 async def faq_questions(message: Message):
@@ -507,7 +517,6 @@ async def faq_questions(message: Message):
         "мини-тест — 3–4 вопроса для самопроверки."
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
-
 
 @router.message(F.text == "Пользовательское соглашение")
 async def faq_offer(message: Message):
@@ -546,7 +555,6 @@ async def faq_offer(message: Message):
         await send_long_text(message, offer_text)
     else:
         await message.answer(offer_text)
-
 
 @router.message(F.text == "Назад")
 async def faq_back(message: Message):
@@ -647,8 +655,6 @@ def _confirm_kb(kind: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"bcast_confirm_{kind}"),
         InlineKeyboardButton(text="❌ Отменить",    callback_data="bcast_cancel"),
     ]])
-
-# (рассылки — без изменений для краткости)
 
 # ---------- Callback-кнопки под статусом ----------
 @router.callback_query(F.data == "show_plans")
