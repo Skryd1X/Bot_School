@@ -1,14 +1,15 @@
 # tts.py
 # Асинхронная озвучка текста через OpenAI TTS.
-# Готовит файлы для Telegram: voice (OGG/Opus) или audio (MP3/WAV).
+# Делает голос понятнее: нормализует формулы/символы, расставляет паузы (SSML).
 
 from __future__ import annotations
 
 import os
 import logging
 import shutil
+import re
 from io import BytesIO
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Iterable
 
 from openai import AsyncOpenAI
 
@@ -20,11 +21,10 @@ OPENAI_BASE_URL      = os.getenv("OPENAI_BASE_URL") or None
 OPENAI_TTS_MODEL     = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")  # основной
 OPENAI_TTS_FALLBACK  = os.getenv("OPENAI_TTS_FALLBACK", "tts-1")         # фолбэк
 TTS_DEFAULT_VOICE    = os.getenv("TTS_VOICE", "alloy")
-# ВАЖНО: для совместимости с API формат по умолчанию делаем ogg (Opus в контейнере OGG)
 TTS_DEFAULT_FORMAT   = os.getenv("TTS_FORMAT", "ogg")  # "ogg"(voice), "mp3", "wav"
-TTS_USE_SSML         = os.getenv("TTS_USE_SSML", "false").lower() == "true"  # если модель понимает SSML
-TTS_SPEED_MIN        = float(os.getenv("TTS_SPEED_MIN", "0.7"))
-TTS_SPEED_MAX        = float(os.getenv("TTS_SPEED_MAX", "1.4"))
+TTS_USE_SSML         = os.getenv("TTS_USE_SSML", "true").lower() == "true"  # включил по умолчанию для пауз
+TTS_SPEED_MIN        = float(os.getenv("TTS_SPEED_MIN", "0.8"))
+TTS_SPEED_MAX        = float(os.getenv("TTS_SPEED_MAX", "1.3"))
 
 if not OPENAI_API_KEY:
     log.warning("OPENAI_API_KEY is empty: TTS will fail without it")
@@ -50,7 +50,6 @@ def _pick_voice(name: Optional[str]) -> str:
         return n
     if n in _VOICE_ALIASES:
         return _VOICE_ALIASES[n]
-    # неизвестные значения не валим в ошибку — подменяем на alloy
     return "alloy"
 
 
@@ -66,7 +65,6 @@ def _mime_ext(fmt: str) -> Tuple[str, str]:
     if fmt == "mp3":
         return "audio/mpeg", "mp3"
     if fmt in {"opus", "ogg"}:
-        # Telegram voice ждёт OGG контейнер с Opus кодеком
         return "audio/ogg", "ogg"
     if fmt == "wav":
         return "audio/wav", "wav"
@@ -80,41 +78,110 @@ def _clamp_speed(speed: Optional[float]) -> Optional[float]:
         s = float(speed)
     except Exception:
         return None
-    # минимальные «ступени», чтобы не гонять постпроцесс ради 1–2%
     if abs(s - 1.0) < 0.02:
         return None
     return max(TTS_SPEED_MIN, min(TTS_SPEED_MAX, s))
 
 
-def _wrap_ssml(text: str, speed: Optional[float]) -> str:
-    """
-    Если включён SSML и задана скорость — оборачиваем текст в <prosody>.
-    Иначе возвращаем как есть.
-    """
-    if not (TTS_USE_SSML and speed and abs(speed - 1.0) > 1e-3):
-        return text
-    # SSML rate в %: 1.0 -> 100%, 0.9 -> 90% и т.д.
-    rate_pct = int(round(speed * 100))
-    return f"<speak><prosody rate=\"{rate_pct}%\">{text}</prosody></speak>"
+# ---------- Нормализация текста под диктовку ----------
 
+_LATEX_PATTERNS = [
+    (r"\\\[|\\\]", " "), (r"\\\(|\\\)", " "),
+    (r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}", r"(\1) делить на (\2)"),
+    (r"\\times", " умножить на "),
+    (r"\\cdot",  " умножить на "),
+    (r"\\leq", " меньше либо равно "),
+    (r"\\geq", " больше либо равно "),
+    (r"\\approx", " примерно равно "),
+    (r"\\sqrt\{([^{}]+)\}", r"квадратный корень из \1"),
+]
+
+def _normalize_equations(text: str) -> str:
+    # убираем код-блоки/инлайн-код, чтобы не диктовать бэктики
+    text = re.sub(r"```.+?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+
+    # латех-подобные штуки
+    for pat, repl in _LATEX_PATTERNS:
+        text = re.sub(pat, repl, text, flags=re.IGNORECASE)
+
+    # степени вида 10^(-7) или a^(2) → читаемо
+    text = re.sub(r"(\b10)\s*\^\s*\(?\s*(-?\d+)\s*\)?", r"\1 в степени \2", text)
+    text = re.sub(r"([a-zA-Zа-яА-Я])\s*\^\s*\(?\s*(\d+)\s*\)?", r"\1 в степени \2", text)
+
+    # символы операций
+    text = text.replace("·", " умножить на ")
+    text = text.replace("*", " умножить на ")
+    text = text.replace("/", " делить на ")
+    text = text.replace("=", " равно ")
+    text = text.replace("≈", " примерно равно ")
+    text = text.replace("≤", " меньше либо равно ")
+    text = text.replace("≥", " больше либо равно ")
+    text = text.replace("≠", " не равно ")
+
+    # единицы/сокращения, немного озвучивания
+    text = re.sub(r"\bкН\b", " килоНьютон ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bН\b", " Ньютон ", text)
+    text = re.sub(r"\bДж\b", " Джоуль ", text)
+    text = re.sub(r"\bм/с\b", " метр в секунду ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bсм\b", " сантиметр ", text, flags=re.IGNORECASE)
+
+    # подчистим лишние обратные слэши/дубли пробелов
+    text = text.replace("\\", " ")
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
+
+
+def _chunk_sentences(text: str) -> list[str]:
+    """
+    Разбиваем на предложения аккуратнее: учитываем сокращения и числа.
+    """
+    text = re.sub(r"\s+", " ", text)
+    # не рвём после сокращений типа "т.д.", "и т.п.", "см.", "рис."
+    boundary = re.compile(r"(?<!\bт\.д)(?<!\bт\.п)(?<!\bи\.т\.д)(?<!\bсм)(?<!\bрис)\.(\s+|$)|[!?](\s+|$)", re.IGNORECASE)
+    parts: list[str] = []
+    start = 0
+    for m in boundary.finditer(text):
+        end = m.end()
+        sent = text[start:end].strip()
+        if sent:
+            parts.append(sent)
+        start = end
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts if parts else [text]
+
+
+def _wrap_ssml(sentences: Iterable[str], speed: Optional[float]) -> str:
+    """
+    Строим SSML с паузами между предложениями.
+    """
+    rate_attr = ""
+    if speed and abs(speed - 1.0) > 1e-3:
+        rate_attr = f' rate="{int(round(speed*100))}%"'
+    body = []
+    for s in sentences:
+        # небольшие паузы внутри длинных формул через запятые/двоеточия
+        s = s.replace(":", ",")
+        body.append(f"<s>{s}</s><break time=\"450ms\"/>")
+    inner = "".join(body)
+    return f"<speak><prosody{rate_attr}>{inner}</prosody></speak>"
+
+
+# ---------- FFmpeg / постобработка ----------
 
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
 def _maybe_speed_postprocess(audio: bytes, fmt_ext: str, speed: Optional[float]) -> bytes:
-    """
-    Лёгкая коррекция скорости через pydub+ffmpeg (если доступны).
-    Работает и для ogg/mp3/wav. Если что-то не так — возвращаем оригинал.
-    """
     speed = _clamp_speed(speed)
     if not speed:
         return audio
     if not _ffmpeg_available():
-        # На slim-образах ffmpeg может отсутствовать — это ок, просто пропускаем
         log.debug("TTS speed post-process skipped: ffmpeg not found")
         return audio
-
     try:
         from pydub import AudioSegment
         from pydub.effects import speedup
@@ -124,8 +191,6 @@ def _maybe_speed_postprocess(audio: bytes, fmt_ext: str, speed: Optional[float])
 
     try:
         src = AudioSegment.from_file(BytesIO(audio), format=fmt_ext)
-        # speedup даёт нормальный тайм-скейлинг с минимальными артефактами
-        # Для замедления (<1) используем ресемплинг через изменение frame_rate.
         if speed >= 1.0:
             changed = speedup(src, playback_speed=speed)
         else:
@@ -144,6 +209,8 @@ def _maybe_speed_postprocess(audio: bytes, fmt_ext: str, speed: Optional[float])
         return audio
 
 
+# ---------- Основные API-функции ----------
+
 async def tts_bytes(
     text: str,
     voice: str | None = None,
@@ -154,37 +221,45 @@ async def tts_bytes(
     """
     Возвращает (audio_bytes, mime, ext).
     fmt: "ogg" для voice (OGG/Opus) или "mp3"/"wav" для send_audio.
-    speed: 0.7..1.4 (мягкая коррекция; если недоступно — игнорируется).
+    speed: 0.8..1.3 (мягкая коррекция; если недоступно — игнорируется).
     """
     if not text or not text.strip():
         raise ValueError("tts: empty text")
+
+    # 1) нормализуем под диктовку
+    text = _normalize_equations(text)
+    sentences = _chunk_sentences(text)
 
     voice = _pick_voice(voice or TTS_DEFAULT_VOICE)
     fmt   = (fmt or TTS_DEFAULT_FORMAT).lower()
     model = model or OPENAI_TTS_MODEL
     speed = _clamp_speed(speed)
 
-    # ВАЖНО: если прилетело "opus", для API это должен быть "ogg"
+    # API понимает "ogg", не "opus"
     api_fmt = "ogg" if fmt in {"opus", "ogg"} else fmt
 
     client = _client_lazy()
-    text_or_ssml = _wrap_ssml(text, speed)
-    wants_ssml = text_or_ssml != text
 
-    # Основной путь — современный TTS (SDK >= 1.99.x)
+    # 2) строим вход: SSML (по умолчанию включён) или plain
+    if TTS_USE_SSML:
+        input_payload = _wrap_ssml(sentences, speed)
+        wants_ssml = True
+    else:
+        # даже без SSML добавим перевод строк для пауз
+        input_payload = "\n\n".join(sentences)
+        wants_ssml = False
+
     try:
-        kwargs = dict(model=model, voice=voice, input=text_or_ssml, format=api_fmt)
-        # Если мы не использовали SSML, но скорость задана, попробуем (молчаливо) передать как vendor-hint.
+        kwargs = dict(model=model, voice=voice, input=input_payload, format=api_fmt)
         if (speed and not wants_ssml):
-            kwargs["speed"] = speed  # если эндпоинт не знает — свалимся в TypeError
-
+            kwargs["speed"] = speed  # если не поддерживается — поймаем TypeError и повторим
         async with client.audio.speech.with_streaming_response.create(**kwargs) as resp:
             buf = BytesIO()
             async for chunk in resp.iter_bytes():
                 buf.write(chunk)
             audio = buf.getvalue()
 
-        # Пост-процесс скорости (если задана и нет SSML)
+        # Пост-процесс скорости только если не SSML
         _, ext_for_post = _mime_ext(api_fmt)
         if speed and not wants_ssml:
             audio = _maybe_speed_postprocess(audio, ext_for_post, speed)
@@ -193,36 +268,30 @@ async def tts_bytes(
         return audio, mime, ext
 
     except TypeError as e:
-        # Случай несовпадения сигнатуры — повтор без «экзотики»
         log.warning("TTS primary failed (%s). Retrying w/o speed/format extras…", e)
         async with client.audio.speech.with_streaming_response.create(
-            model=model,
-            voice=voice,
-            input=text_or_ssml,
+            model=model, voice=voice, input=input_payload
         ) as resp:
             buf = BytesIO()
             async for chunk in resp.iter_bytes():
                 buf.write(chunk)
             audio = buf.getvalue()
-        # чаще всего тут придёт WAV
-        if speed and not wants_ssml:
+        if speed and not TTS_USE_SSML:
             audio = _maybe_speed_postprocess(audio, "wav", speed)
         return audio, "audio/wav", "wav"
 
     except Exception as e:
         log.warning("TTS error (%s). Trying fallback model %s…", e, OPENAI_TTS_FALLBACK)
-        # Фоллбек на tts-1 (широко доступна)
         async with client.audio.speech.with_streaming_response.create(
             model=OPENAI_TTS_FALLBACK,
             voice=voice,
-            input=text,         # на фоллбэке без SSML надёжнее
+            input="\n\n".join(sentences),   # на фолбэке plain надёжнее
             format="mp3",
         ) as resp:
             buf = BytesIO()
             async for chunk in resp.iter_bytes():
                 buf.write(chunk)
             audio = buf.getvalue()
-        # При желании подправим скорость через ffmpeg/pydub
         audio = _maybe_speed_postprocess(audio, "mp3", speed)
         return audio, "audio/mpeg", "mp3"
 
@@ -231,7 +300,6 @@ async def tts_voice_ogg(text: str, voice: str | None = None, speed: Optional[flo
     """
     Готовит файл для Telegram voice: .ogg (Opus).
     """
-    # просим ogg (совместимо с API), а не «opus»
     audio, _, ext = await tts_bytes(text, voice=voice, fmt="ogg", speed=speed)
     bio = BytesIO(audio)
     bio.name = f"voice.{ext}"
@@ -256,39 +324,34 @@ async def tts_audio_file(
     return bio, mime
 
 
-def split_for_tts(text: str, max_chars: int = 3000) -> list[str]:
+# ---------- Разбиение на куски для длинных ответов ----------
+
+def split_for_tts(text: str, max_chars: int = 2800) -> list[str]:
     """
-    Безопасно режем длинный текст на куски по предложениям,
-    чтобы Telegram и TTS не упирались в лимиты.
+    Режем по абзацам и предложениям, чтобы куски заканчивались на паузах.
     """
     text = " ".join((text or "").split())
     if len(text) <= max_chars:
         return [text]
 
+    # Сперва абзацы
+    paras = re.split(r"(?:\n\s*){2,}", text)
     out: list[str] = []
-    cur = []
-    cur_len = 0
-    for sent in _smart_sentences(text):
-        if cur_len + len(sent) + 1 > max_chars and cur:
-            out.append(" ".join(cur))
-            cur = [sent]
-            cur_len = len(sent)
-        else:
-            cur.append(sent)
-            cur_len += len(sent) + 1
-    if cur:
-        out.append(" ".join(cur))
+    cur = ""
+    for para in paras:
+        sents = _chunk_sentences(para)
+        for s in sents:
+            if len(cur) + len(s) + 1 > max_chars:
+                if cur:
+                    out.append(cur.strip())
+                    cur = s
+                else:
+                    out.append(s[:max_chars])
+                    cur = s[max_chars:]
+            else:
+                cur = (cur + " " + s).strip()
+        if cur:
+            cur += "\n\n"
+    if cur.strip():
+        out.append(cur.strip())
     return out
-
-
-def _smart_sentences(text: str) -> list[str]:
-    end = {".", "!", "?"}
-    sents, cur = [], []
-    for ch in text:
-        cur.append(ch)
-        if ch in end:
-            sents.append("".join(cur).strip())
-            cur = []
-    if cur:
-        sents.append("".join(cur).strip())
-    return sents or [text.strip()]
