@@ -62,7 +62,7 @@ BOT_USERNAME          = os.getenv("BOT_USERNAME", "your_bot").lstrip("@")  # б�
 REF_BONUS_THRESHOLD   = int(os.getenv("REF_BONUS_THRESHOLD", "6"))         # каждые N оплат = +1 месяц PRO
 
 # Параметры TTS
-TTS_ENABLED_DEFAULT_PRO = True
+TTS_ENABLED_DEFAULT_PRO = False
 TTS_CHUNK_LIMIT = 2500
 
 def tribute_url(code: str) -> str:
@@ -1024,11 +1024,23 @@ async def cb_export_pdf(call: CallbackQuery):
 
 # ======= Мини-тест с кнопками A/B/C/D =======
 def _quiz_kb(qi: dict, q_index: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+
     options = (qi.get("options") or [])[:4]
     for i, opt in enumerate(options):
-        kb.button(text=f"{chr(65+i)}) {opt}", callback_data=f"quiz_answer:{q_index}:{i}")
-    return kb.as_markup()
+        # каждая кнопка в СВОЕЙ строке
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{chr(65+i)}) {opt}",
+                callback_data=f"quiz_answer:{q_index}:{i}"
+            )
+        )
+
+    # на всякий случай зафиксируем ширину строки = 1
+    builder.adjust(1)
+    return builder.as_markup()
+
 
 @router.callback_query(F.data == "quiz_make")
 async def cb_quiz_make(call: CallbackQuery):
