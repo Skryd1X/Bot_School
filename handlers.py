@@ -14,6 +14,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardRemove,
     BufferedInputFile,
+    InputMediaPhoto,
 )
 from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.context import FSMContext
@@ -47,7 +48,7 @@ router = Router()
 # ---------- Константы/окружение ----------
 COOLDOWN_SECONDS   = 5
 MIN_INTERVAL_SEND  = 1.1
-MIN_EDIT_INTERVAL  = 0.15   # чуть чаще правим текст, чтобы «тёк» живее
+MIN_EDIT_INTERVAL  = 0.25
 MAX_TG_LEN         = 4096
 
 TRIBUTE_LITE_STARTAPP = os.getenv("TRIBUTE_LITE_STARTAPP", "")
@@ -65,9 +66,6 @@ TTS_CHUNK_LIMIT = 2500
 
 def tribute_url(code: str) -> str:
     return f"https://t.me/tribute/app?startapp={code}"
-
-# Память для последнего мини-теста (на чат)
-LAST_QUIZ: Dict[int, Dict] = {}
 
 # ---------- План/клавиатуры ----------
 async def _plan_flags(chat_id: int) -> Tuple[bool, bool, bool]:
@@ -646,6 +644,134 @@ def _confirm_kb(kind: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="❌ Отменить",    callback_data="bcast_cancel"),
     ]])
 
+# ---- Админ кнопки
+@router.message(F.text == "📊 Кол-во подписчиков")
+async def admin_count(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    ids = await get_all_chat_ids()
+    await message.answer(f"Подписчиков (в базе): {len(ids)}")
+
+@router.message(F.text == "📢 Рассылка — текст")
+async def admin_broadcast_text_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminBroadcastStates.waiting_for_text)
+    await message.answer("Пришлите текст рассылки (plain/markdown).")
+
+@router.message(AdminBroadcastStates.waiting_for_text, F.text)
+async def admin_broadcast_text_preview(message: Message, state: FSMContext):
+    await state.update_data(kind="text", text=message.text)
+    await state.set_state(AdminBroadcastStates.confirm)
+    await message.answer("Предпросмотр рассылки:", reply_markup=ReplyKeyboardRemove())
+    await message.answer(message.text)
+    await message.answer("Разослать?", reply_markup=_confirm_kb("text"))
+
+@router.message(F.text == "🖼️ Рассылка — фото")
+async def admin_broadcast_photo_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminBroadcastStates.waiting_for_photo)
+    await message.answer("Пришлите фото для рассылки.")
+
+@router.message(AdminBroadcastStates.waiting_for_photo, F.photo)
+async def admin_broadcast_photo_got(message: Message, state: FSMContext):
+    await state.update_data(kind="photo", file_id=message.photo[-1].file_id)
+    await state.set_state(AdminBroadcastStates.waiting_for_caption)
+    await message.answer("Добавьте подпись к фото (или пришлите «-» чтобы без подписи).")
+
+@router.message(AdminBroadcastStates.waiting_for_caption, F.text)
+async def admin_broadcast_photo_preview(message: Message, state: FSMContext):
+    data = await state.get_data()
+    caption = None if message.text.strip() == "-" else message.text
+    await state.update_data(caption=caption)
+    await state.set_state(AdminBroadcastStates.confirm)
+    await message.answer("Предпросмотр рассылки:", reply_markup=ReplyKeyboardRemove())
+    await message.answer_photo(photo=data["file_id"], caption=caption)
+    await message.answer("Разослать?", reply_markup=_confirm_kb("photo"))
+
+@router.callback_query(F.data == "bcast_cancel")
+async def admin_broadcast_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Рассылка отменена.")
+    await call.answer()
+
+async def _deliver_to_all(bot, send_corofn, progress_msg: Message):
+    ids: List[int] = await get_all_chat_ids()
+    total = len(ids)
+    ok = 0
+    sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+
+    async def send_one(chat_id: int):
+        nonlocal ok
+        async with sem:
+            try:
+                await send_corofn(chat_id)
+                ok += 1
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                try:
+                    await send_corofn(chat_id)
+                    ok += 1
+                except Exception:
+                    pass
+            except TelegramBadRequest as e:
+                # удалённый чат/блок — можно почистить
+                txt = str(e).lower()
+                if "bot was blocked" in txt or "chat not found" in txt:
+                    try:
+                        await drop_chat(chat_id)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # прогресс
+            try:
+                pct = ok / max(1, total)
+                await bot.edit_message_text(
+                    chat_id=progress_msg.chat.id,
+                    message_id=progress_msg.message_id,
+                    text=f"Рассылка… {ok}/{total} {_progress_bar(pct)}"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(BROADCAST_DELAY_SEC)
+
+    await asyncio.gather(*(send_one(cid) for cid in ids))
+    try:
+        await bot.edit_message_text(
+            chat_id=progress_msg.chat.id,
+            message_id=progress_msg.message_id,
+            text=f"Готово ✅ Отправлено: {ok}/{total}"
+        )
+    except Exception:
+        pass
+
+@router.callback_query(F.data.in_(("bcast_confirm_text", "bcast_confirm_photo")))
+async def admin_broadcast_confirm(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    data = await state.get_data()
+    kind = "text" if call.data.endswith("text") else "photo"
+    await state.clear()
+
+    progress = await call.message.answer("Рассылка…")
+    bot = call.message.bot
+
+    if kind == "text":
+        text = data["text"]
+        async def sender(chat_id: int):
+            await bot.send_message(chat_id, text)
+        await _deliver_to_all(bot, sender, progress)
+    else:
+        file_id = data["file_id"]
+        caption = data.get("caption")
+        async def sender(chat_id: int):
+            await bot.send_photo(chat_id, file_id, caption=caption)
+        await _deliver_to_all(bot, sender, progress)
+
+    await call.answer()
+
 # ---------- Callback-кнопки под статусом ----------
 @router.callback_query(F.data == "show_plans")
 async def cb_show_plans(call: CallbackQuery):
@@ -683,7 +809,6 @@ async def generate_answer(message: Message, state: FSMContext):
     if not user_text:
         return
 
-    # антиспам
     now = time.monotonic()
     next_allowed = _next_allowed_by_chat.get(chat_id, 0.0)
     if now < next_allowed:
@@ -692,14 +817,12 @@ async def generate_answer(message: Message, state: FSMContext):
         return
     _next_allowed_by_chat[chat_id] = now + COOLDOWN_SECONDS
 
-    # учёт лимитов
     await ensure_user(chat_id)
     allowed, msg = await can_use(await ensure_user(chat_id), "text")
     if not allowed:
         await message.answer(msg, reply_markup=plans_kb(show_back=True))
         return
 
-    # Режим Учителя — только для PRO
     is_pro = await _is_pro(chat_id)
     if is_pro and await is_teacher_mode(chat_id):
         user_text = (
@@ -727,8 +850,7 @@ async def generate_answer(message: Message, state: FSMContext):
 
     try:
         history_msgs = await get_history(chat_id)
-        # приоритезируем PRO (может помочь вашему бекенду)
-        async for delta in stream_response_text(user_text, history_msgs, priority=is_pro):
+        async for delta in stream_response_text(user_text, history_msgs, priority=is_pro, teacher_mode=False):
             accumulated += delta
             t = asyncio.get_event_loop().time()
             if t - last_edit >= MIN_EDIT_INTERVAL:
@@ -751,7 +873,6 @@ async def generate_answer(message: Message, state: FSMContext):
         await add_history(chat_id, "assistant", accumulated or "")
         await inc_usage(chat_id, "text")
 
-        # авто-TTS только для PRO
         if is_pro:
             vs = await get_voice_settings(chat_id)
             if vs.get("auto") and accumulated:
@@ -871,54 +992,23 @@ async def cb_export_pdf(call: CallbackQuery):
     except Exception as e:
         await call.answer(f"Ошибка экспорта: {e}", show_alert=True)
 
-# ====== Мини-тест ======
-def _quiz_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Показать ответы", callback_data="quiz_answers"),
-        InlineKeyboardButton(text="🔁 Ещё тест",        callback_data="quiz_more"),
-    ]])
-
 @router.callback_query(F.data == "quiz_make")
 async def cb_quiz_make(call: CallbackQuery):
     chat_id = call.message.chat.id
     if not await _is_pro(chat_id):
         return await call.answer("Мини-тест доступен только в PRO.", show_alert=True)
 
-    base_text = await _last_assistant_text(chat_id)
-    if not base_text:
-        return await call.answer("Нет последнего ответа для теста.", show_alert=True)
+    answer = await _last_assistant_text(chat_id)
+    if not answer or len(answer) < 40:
+        return await call.answer("Сначала получи разбор/ответ, потом сделаю тест.", show_alert=True)
 
-    md, data = await quiz_from_answer(base_text, n_questions=4)
-    LAST_QUIZ[chat_id] = data or {"questions":[]}
-
-    await call.message.answer(f"🧠 Мини-тест\n\n{md}", reply_markup=_quiz_kb())
-    await call.answer()
-
-@router.callback_query(F.data == "quiz_answers")
-async def cb_quiz_answers(call: CallbackQuery):
-    chat_id = call.message.chat.id
-    data = LAST_QUIZ.get(chat_id, {"questions":[]})
-    qs = data.get("questions") or []
-    if not qs:
-        return await call.answer("Нет сохранённых ответов для этого теста.", show_alert=True)
-    lines = ["📘 Ответы:"]
-    for i, q in enumerate(qs, 1):
-        corr = q.get("correct")
-        why  = q.get("why") or ""
-        lines.append(f"{i}) {corr}{' — ' + why if why else ''}")
-    await call.message.answer("\n".join(lines))
-    await call.answer()
-
-@router.callback_query(F.data == "quiz_more")
-async def cb_quiz_more(call: CallbackQuery):
-    chat_id = call.message.chat.id
-    base_text = await _last_assistant_text(chat_id)
-    if not base_text:
-        return await call.answer("Нет текста для генерации теста.", show_alert=True)
-    md, data = await quiz_from_answer(base_text, n_questions=4)
-    LAST_QUIZ[chat_id] = data or {"questions":[]}
-    await call.message.answer(f"🧠 Мини-тест\n\n{md}", reply_markup=_quiz_kb())
-    await call.answer()
+    await call.answer("Готовлю мини-тест…", show_alert=False)
+    try:
+        md, data = await quiz_from_answer(answer, n_questions=4)
+        # просто отправляем markdown версию
+        await call.message.answer(f"🧠 Мини-тест\n\n{md}")
+    except Exception as e:
+        await call.message.answer(f"❌ Не удалось построить тест: {e}")
 
 # Апселл-замочки
 @router.callback_query(F.data.in_(("need_pro_pdf","need_pro_quiz")))
