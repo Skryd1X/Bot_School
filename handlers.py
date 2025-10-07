@@ -167,27 +167,34 @@ async def _send_referral_card(message: Message):
     link  = _ref_link_from_code(code)
     paid  = int(stats.get("referred_paid_count") or 0)
     total = int(stats.get("referred_count") or 0)
-    left  = max(0, REF_BONUS_THRESHOLD - (paid % REF_BONUS_THRESHOLD))
-    progress = paid % REF_BONUS_THRESHOLD
-    meter = "█"*progress + "—"*(REF_BONUS_THRESHOLD-progress)
+
+    # Берём порог локально — если вдруг глобали нет, возьмём из ENV (дефолт 6)
+    threshold = globals().get("REF_BONUS_THRESHOLD", int(os.getenv("REF_BONUS_THRESHOLD", "6")))
+
+    progress = paid % threshold
+    left     = max(0, threshold - progress)
+    meter    = "█"*progress + "—"*(threshold-progress)
 
     text = (
         "🎁 <b>Бонус за друзей</b>\n\n"
         f"Приглашай друзей по персональной ссылке.\n"
-        f"За каждые <b>{REF_BONUS_THRESHOLD}</b> покупок (LITE/PRO) по твоей ссылке — <b>+1 месяц PRO</b>.\n\n"
+        f"За каждые <b>{threshold}</b> покупок (LITE/PRO) по твоей ссылке — <b>+1 месяц PRO</b>.\n\n"
         f"🔗 <b>Твоя ссылка:</b>\n<code>{link}</code>\n\n"
         f"📊 <b>Статистика</b>\n"
         f"— Всего приглашено: <b>{total}</b>\n"
         f"— Купили подписку: <b>{paid}</b>\n"
-        f"— Прогресс до подарка: [{meter}] {progress}/{REF_BОНУС_THRESHOLD}\n"
+        f"— Прогресс до подарка: [{meter}] {progress}/{threshold}\n"
         f"— До следующего подарка: <b>{left}</b>\n\n"
         "Поделись ссылкой с одногруппниками, в чатах курса или друзьям 👇"
     )
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔗 Открыть ссылку", url=link),
         _share_button(link, "Помощник для учёбы — моя реф. ссылка:")
     ]])
+
     await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
 
 # ---------- Безопасные отправки/редактирования ----------
 async def _respect_rate_limit(chat_id: int):
