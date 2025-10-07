@@ -1,6 +1,6 @@
 # tts.py
-# Асинхронная озвучка через OpenAI TTS без спорных аргументов SDK.
-# Берём WAV из API -> конвертируем локально в OGG/Opus 48k (качество для Telegram voice).
+# Асинхронная озвучка через OpenAI TTS.
+# Авто-детект формата ответа (MP3/WAV/OGG/…) -> нормализация -> экспорт в OGG/Opus для Telegram.
 
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ _client: AsyncOpenAI | None = None
 _ALLOWED_VOICES = {"nova","shimmer","echo","onyx","fable","alloy","ash","sage","coral"}
 _VOICE_ALIASES  = {"aria":"alloy","verse":"alloy","v2":"alloy","default":"alloy"}
 
+
+# ---------- Helpers (client, speed, mime) ----------
 def _pick_voice(name: Optional[str]) -> str:
     if not name: return "alloy"
     n = str(name).strip().lower()
@@ -61,7 +63,11 @@ def _clamp_speed(speed: Optional[float]) -> Optional[float]:
     if abs(s-1.0) < 0.02: return None
     return max(TTS_SPEED_MIN, min(TTS_SPEED_MAX, s))
 
-# ---------- Нормализация текста ----------
+def _ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+# ---------- Текст: нормализация формул и паузы ----------
 _LATEX_PATTERNS = [
     (r"\\\[|\\\]", " "), (r"\\\(|\\\)", " "),
     (r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}", r"(\1) делить на (\2)"),
@@ -105,43 +111,67 @@ def _wrap_ssml(sentences: Iterable[str], speed: Optional[float]) -> str:
     body = "".join(f"<s>{s}</s><break time=\"420ms\"/>" for s in sentences)
     return f"<speak><prosody{rate}>{body}</prosody></speak>"
 
-# ---------- Локальная конвертация ----------
-def _ffmpeg_available() -> bool: return shutil.which("ffmpeg") is not None
 
-def _to_ogg_opus(wav_bytes: bytes, bitrate: str = "32k") -> bytes:
-    """WAV/PCM -> OGG/Opus 48k mono, VBR on (лучше для Telegram voice)."""
-    if not _ffmpeg_available():
-        raise RuntimeError("ffmpeg not found for opus conversion")
+# ---------- Декодирование входа: авто-детект формата ----------
+def _detect_audio_format(data: bytes) -> str:
+    """Возвращает hint формата для pydub/ffmpeg: 'wav'|'mp3'|'ogg'|'flac'|'webm'…"""
+    if len(data) < 8:
+        return "wav"
+    h4 = data[:4]
+    h8 = data[:8]
+    if h4 == b"RIFF" and data[8:12] == b"WAVE":
+        return "wav"
+    if h3 := data[:3]:
+        if h3 == b"ID3":   # ID3 тег
+            return "mp3"
+    # MP3 frame sync: FF FB / F3 / F2 …
+    if h2 := data[:2]:
+        if h2[0] == 0xFF and (h2[1] & 0xE0) == 0xE0:
+            return "mp3"
+    if h4 == b"OggS":
+        return "ogg"
+    if h4 == b"fLaC":
+        return "flac"
+    if h8.startswith(b"\x1a\x45\xdf\xa3"):
+        return "webm"
+    return "wav"  # по умолчанию попробуем WAV
+
+def _load_segment(data: bytes, fmt_hint: Optional[str] = None):
+    """Создаёт AudioSegment из байт с авто-детектом формата."""
     try:
         from pydub import AudioSegment
     except Exception as e:
         raise RuntimeError(f"pydub not available: {e}")
-    seg = AudioSegment.from_file(BytesIO(wav_bytes), format="wav").set_channels(1).set_frame_rate(48000)
+    fmt = fmt_hint or _detect_audio_format(data)
+    return AudioSegment.from_file(BytesIO(data), format=fmt)
+
+def _maybe_speed_segment(seg, speed: Optional[float]):
+    s = _clamp_speed(speed)
+    if not s:
+        return seg
+    try:
+        from pydub.effects import speedup
+    except Exception:
+        return seg
+    if s >= 1.0:
+        return speedup(seg, playback_speed=s)
+    # замедление — ресемплинг
+    new_rate = int(seg.frame_rate * s)
+    return seg._spawn(seg.raw_data, overrides={"frame_rate": new_rate}).set_frame_rate(seg.frame_rate)
+
+
+# ---------- Экспорт ----------
+def _export_ogg_opus(seg) -> bytes:
+    """Выгружает в OGG/Opus 48k mono, libopus VBR."""
+    if not _ffmpeg_available():
+        raise RuntimeError("ffmpeg not found for opus conversion")
     buf = BytesIO()
-    seg.export(
+    seg.set_channels(1).set_frame_rate(48000).export(
         buf, format="ogg", codec="libopus",
-        bitrate=bitrate,
-        parameters=["-vbr","on","-compression_level","10"]
+        bitrate="40k", parameters=["-vbr","on","-compression_level","10"]
     )
     return buf.getvalue()
 
-def _maybe_speed_postprocess(audio_wav: bytes, speed: Optional[float]) -> bytes:
-    s = _clamp_speed(speed)
-    if not s: return audio_wav
-    if not _ffmpeg_available(): return audio_wav
-    try:
-        from pydub import AudioSegment
-        from pydub.effects import speedup
-    except Exception:
-        return audio_wav
-    src = AudioSegment.from_file(BytesIO(audio_wav), format="wav")
-    if s >= 1.0:
-        changed = speedup(src, playback_speed=s)
-    else:
-        new_rate = int(src.frame_rate * s)
-        changed = src._spawn(src.raw_data, overrides={"frame_rate": new_rate}).set_frame_rate(src.frame_rate)
-    buf = BytesIO(); changed.export(buf, format="wav")
-    return buf.getvalue()
 
 # ---------- Основные функции ----------
 async def tts_bytes(
@@ -158,7 +188,7 @@ async def tts_bytes(
     if not text or not text.strip():
         raise ValueError("tts: empty text")
 
-    # 1) нормализуем
+    # нормализуем формулы/обозначения
     text = _normalize_equations(text)
     sents = _chunk_sentences(text)
 
@@ -168,12 +198,10 @@ async def tts_bytes(
     speed = _clamp_speed(speed)
 
     client = _client_lazy()
-
-    # 2) строим вход (SSML или plain), НО НЕ передаём спорные поля (format/speed)
     input_payload = _wrap_ssml(sents, speed) if TTS_USE_SSML else "\n\n".join(sents)
 
     async def _synthesize(_model: str, payload: str) -> bytes:
-        # Возвращаем «сырые» байты (обычно WAV/PCM) без параметров, которые ломают SDK.
+        # ВАЖНО: без параметров format/speed — разные SDK их трактуют по-разному
         async with client.audio.speech.with_streaming_response.create(
             model=_model, voice=voice, input=payload
         ) as resp:
@@ -182,37 +210,41 @@ async def tts_bytes(
                 buf.write(chunk)
             return buf.getvalue()
 
-    # основной + фолбэк
+    # 1) пробуем основной TTS; 2) фолбэк plain-текстом
     try:
-        wav = await _synthesize(model, input_payload)
+        raw = await _synthesize(model, input_payload)
     except Exception as e:
-        log.warning("Основной TTS-преобразователь не удалось (метод AsyncSpeech.create()): %s. Переход на fallback…", e)
-        # на фолбэке plain обычно стабильнее
-        payload = "\n\n".join(sents)
-        wav = await _synthesize(OPENAI_TTS_FALLBACK, payload)
+        log.warning("TTS primary failed: %s. Fallback to %s…", e, OPENAI_TTS_FALLBACK)
+        raw = await _synthesize(OPENAI_TTS_FALLBACK, "\n\n".join(sents))
 
-    # 3) пост-процесс (темп) в WAV
-    wav = _maybe_speed_postprocess(wav, speed)
+    # 2) декодируем независимо от формата (mp3/wav/…)
+    try:
+        seg = _load_segment(raw)
+    except Exception as e:
+        # иногда API отдаёт mp3 без заголовка ID3 → подскажем явно
+        try:
+            seg = _load_segment(raw, "mp3")
+        except Exception:
+            log.error("Cannot decode audio from TTS: %s", e)
+            # отдаём как есть (редкий случай)
+            return raw, "audio/wav", "wav"
 
-    # 4) нужный формат наружу
+    # 3) темп/нормализация
+    seg = _maybe_speed_segment(seg, speed)
+
+    # 4) экспорт в нужный формат
     if fmt in {"opus","ogg"}:
         try:
-            ogg = _to_ogg_opus(wav, bitrate="40k")  # чётче артикуляция
+            ogg = _export_ogg_opus(seg)
             return ogg, "audio/ogg", "ogg"
         except Exception as e:
-            log.warning("Не удалось конвертировать в Opus: %s. Отдаю WAV.", e)
-            return wav, "audio/wav", "wav"
+            log.warning("Opus export failed (%s). Returning WAV.", e)
+            buf = BytesIO(); seg.export(buf, format="wav"); return buf.getvalue(), "audio/wav", "wav"
     elif fmt == "mp3":
-        # если очень надо mp3 — перекодируем через ogg->mp3 или прямо из wav
-        try:
-            from pydub import AudioSegment
-            seg = AudioSegment.from_file(BytesIO(wav), format="wav")
-            buf = BytesIO(); seg.export(buf, format="mp3", bitrate="128k")
-            return buf.getvalue(), "audio/mpeg", "mp3"
-        except Exception:
-            return wav, "audio/wav", "wav"
+        buf = BytesIO(); seg.export(buf, format="mp3", bitrate="128k"); return buf.getvalue(), "audio/mpeg", "mp3"
     else:
-        return wav, "audio/wav", "wav"
+        buf = BytesIO(); seg.export(buf, format="wav"); return buf.getvalue(), "audio/wav", "wav"
+
 
 async def tts_voice_ogg(text: str, voice: str | None = None, speed: Optional[float] = None) -> BytesIO:
     audio, _, ext = await tts_bytes(text, voice=voice, fmt="ogg", speed=speed)
@@ -223,6 +255,7 @@ async def tts_audio_file(text: str, voice: str | None = None, fmt: str = "mp3", 
     audio, mime, ext = await tts_bytes(text, voice=voice, fmt=fmt, speed=speed)
     bio = BytesIO(audio); bio.name = f"audio.{ext}"; bio.seek(0)
     return bio, mime
+
 
 # ---------- Разбиение длинных ответов ----------
 def split_for_tts(text: str, max_chars: int = 2800) -> list[str]:
