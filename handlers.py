@@ -99,26 +99,26 @@ def answer_actions_kb(is_pro: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def main_kb_for_plan(is_free: bool) -> ReplyKeyboardMarkup:
-    # Кнопка рефералок есть у всех
-    ref_row = [KeyboardButton(text="🎁 Бонус за друзей")]
     if is_free:
+        # 1-й ряд: апгрейд + FAQ, 2-й ряд: настройки + рефералка
         keyboard = [
-            [KeyboardButton(text="🔼 Обновить план")],
-            [KeyboardButton(text="FAQ / Помощь")],
-            [KeyboardButton(text="⚙️ Настройки")],
-            ref_row,
+            [KeyboardButton(text="🔼 Обновить план"), KeyboardButton(text="FAQ / Помощь")],
+            [KeyboardButton(text="⚙️ Настройки"),     KeyboardButton(text="🎁 Бонус за друзей")],
         ]
     else:
+        # 1-й ряд: мои подписки + FAQ, 2-й ряд: настройки + рефералка
         keyboard = [
-            [KeyboardButton(text="🧾 Мои подписки")],
-            [KeyboardButton(text="FAQ / Помощь")],
-            [KeyboardButton(text="⚙️ Настройки")],
-            ref_row,
+            [KeyboardButton(text="🧾 Мои подписки"),  KeyboardButton(text="FAQ / Помощь")],
+            [KeyboardButton(text="⚙️ Настройки"),     KeyboardButton(text="🎁 Бонус за друзей")],
         ]
+
     return ReplyKeyboardMarkup(
-        keyboard=keyboard, resize_keyboard=True, is_persistent=True,
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
         input_field_placeholder="Напишите вопрос или пришлите фото…",
     )
+
 
 SETTINGS_KB = ReplyKeyboardMarkup(
     keyboard=[
