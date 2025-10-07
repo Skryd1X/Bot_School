@@ -1,6 +1,8 @@
 # generators.py
 import os
 import base64
+import json
+import re
 from typing import AsyncIterator, List, Dict, Any, Literal, Tuple, Optional
 
 from openai import AsyncOpenAI
@@ -102,6 +104,14 @@ def style_to_template(style: str | None) -> AnswerTemplate:
         return "essay_outline"
     return "default"
 
+# ---------- Вспомогалка: ужимаем историю (чтоб не плодить токены/мусор) ----------
+def _compact_history(history: List[Dict[str, str]], max_items: int = 12) -> List[Dict[str, str]]:
+    if not history:
+        return []
+    # оставляем последние max_items сообщений, чистим пустое
+    h = [m for m in history if isinstance(m, dict) and m.get("role") in {"user","assistant"} and (m.get("content") or "").strip()]
+    return h[-max_items:]
+
 # ---------- Сборка messages ----------
 def _build_messages(
     user_text: str,
@@ -121,7 +131,7 @@ def _build_messages(
         messages.append({"role": "system", "content": TEACHER_MODE})
 
     if history:
-        messages.extend(history)
+        messages.extend(_compact_history(history))
     messages.append({"role": "user", "content": user_text})
     return messages
 
@@ -131,22 +141,32 @@ async def stream_chat(
     temperature: float = 0.4,
     priority: bool = False,
 ) -> AsyncIterator[str]:
-    extra = {}
-    if priority:
-        extra = {"extra_headers": {"X-Queue": "priority", "X-Tier": "pro"},
-                 "metadata": {"queue": "priority", "tier": "pro"}}
+    """
+    Стрим на chat.completions. Без metadata (чтобы не ловить 400).
+    При падении — мягкий fallback на не-стрим.
+    """
+    kwargs: Dict[str, Any] = dict(model=TEXT_MODEL, messages=messages, temperature=temperature, stream=True)
 
-    stream = await client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=messages,
-        temperature=temperature,
-        stream=True,
-        **extra,
-    )
-    async for chunk in stream:
-        delta = (chunk.choices[0].delta.content or "")
-        if delta:
-            yield delta
+    # Приоритетные заголовки можно оставить для своей очереди, но это просто HTTP-хедеры.
+    if priority:
+        kwargs["extra_headers"] = {"X-Queue": "priority", "X-Tier": "pro"}
+
+    try:
+        stream = await client.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            delta = (chunk.choices[0].delta.content or "")
+            if delta:
+                yield delta
+    except Exception:
+        # fallback: одним куском
+        resp = await client.chat.completions.create(
+            model=TEXT_MODEL, messages=messages, temperature=temperature
+        )
+        text = resp.choices[0].message.content or ""
+        if text:
+            # режем на маленькие порции, чтобы интерфейс «оживал»
+            for i in range(0, len(text), 200):
+                yield text[i:i+200]
 
 async def stream_response_text(
     user_text: str,
@@ -173,17 +193,11 @@ async def generate_text(
         temperature = 0.15 if _needs_engineering_mode(user_text) else 0.4
     messages = _build_messages(user_text, history, template=template, teacher_mode=teacher_mode)
 
-    extra = {}
+    kwargs: Dict[str, Any] = dict(model=TEXT_MODEL, messages=messages, temperature=temperature)
     if priority:
-        extra = {"extra_headers": {"X-Queue": "priority", "X-Tier": "pro"},
-                 "metadata": {"queue": "priority", "tier": "pro"}}
+        kwargs["extra_headers"] = {"X-Queue": "priority", "X-Tier": "pro"}
 
-    resp = await client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=messages,
-        temperature=temperature,
-        **extra,
-    )
+    resp = await client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content or ""
 
 # ---------- «Учитель объясняет» ----------
@@ -200,6 +214,49 @@ async def generate_by_template(
 ) -> str:
     return await generate_text(user_text, history, template=template, teacher_mode=False, priority=priority)
 
+# ---------- Безопасный парсер JSON из LLM ----------
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_FIRST_OBJ_RE  = re.compile(r"\{.*\}", re.DOTALL)
+
+def _safe_load_json(text: str) -> Dict[str, Any]:
+    """
+    Достаём первый валидный JSON-объект:
+    - пробуем fenced-блок ```json
+    - иначе берём первую {...}
+    - заменяем одинарные кавычки на двойные, убираем висячие запятые
+    """
+    if not text:
+        return {}
+    t = text.strip()
+
+    m = _JSON_BLOCK_RE.search(t)
+    if not m:
+        m = _FIRST_OBJ_RE.search(t)
+    if not m:
+        return {}
+
+    s = m.group(1) if m.lastindex else m.group(0)
+    # грубая нормализация
+    s = s.strip()
+    # убираем комментарии в стиле // и /* */
+    s = re.sub(r"//.*?$", "", s, flags=re.MULTILINE)
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
+    # одиночные → двойные (осторожно)
+    if "'" in s and '"' not in s:
+        s = s.replace("'", '"')
+    # висячие запятые перед закрывающей скобкой/квадратной
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+
+    try:
+        return json.loads(s)
+    except Exception:
+        # финальная попытка: удалить непечатаемые символы
+        s2 = "".join(ch for ch in s if ord(ch) >= 32)
+        try:
+            return json.loads(s2)
+        except Exception:
+            return {}
+
 # ---------- Mini-quiz по уже сгенерированному ответу ----------
 # Возвращает (markdown, сырой JSON со структурой)
 async def quiz_from_answer(answer_text: str, n_questions: int = 4) -> Tuple[str, Dict[str, Any]]:
@@ -212,8 +269,8 @@ async def quiz_from_answer(answer_text: str, n_questions: int = 4) -> Tuple[str,
         f"Сделай {n_questions} вопрос(а) множественного выбора по материалу ниже. "
         "На каждый вопрос — ровно 4 варианта (A–D), один правильный. "
         "СНАЧАЛА верни ТОЛЬКО JSON вида: "
-        "{'questions':[{'q':'...','options':['A','B','C','D'],'correct':'A','why':'краткое объяснение'}]} "
-        "Без пояснений и текста после JSON.\n\n"
+        "{\"questions\":[{\"q\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"correct\":\"A\",\"why\":\"краткое объяснение\"}]}"
+        " Без пояснений и текста после JSON.\n\n"
         "=== Исходный разбор ===\n" + (answer_text or "")
     )
     resp = await client.chat.completions.create(
@@ -223,51 +280,51 @@ async def quiz_from_answer(answer_text: str, n_questions: int = 4) -> Tuple[str,
     )
     raw = resp.choices[0].message.content or ""
 
-    # --- безопасный парсинг JSON ---
-    import json, re
-    json_obj: Dict[str, Any] = {"questions":[]}
-    md = ""
-    m = re.search(r"\{.*\}\s*\Z", raw, re.DOTALL)
-    if m:
-        json_str = m.group(0)
-        try:
-            json_obj = json.loads(json_str.replace("'", '"'))
-        except Exception:
-            json_obj = {"questions":[]}
-    else:
-        # если модель всё же добавила текст вокруг — выдёрнем первую {...}
-        m2 = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m2:
-            try:
-                json_obj = json.loads(m2.group(0).replace("'", '"'))
-            except Exception:
-                json_obj = {"questions":[]}
+    data = _safe_load_json(raw)
+    if not isinstance(data, dict):
+        data = {}
+    questions = data.get("questions") or []
+
+    # санитизация структуры
+    fixed_questions = []
+    for q in questions:
+        qtext = str(q.get("q","")).strip()
+        opts  = list(q.get("options") or [])
+        # выравниваем до 4
+        opts = (opts + ["—"]*4)[:4]
+        corr = str(q.get("correct","A")).strip().upper()[:1]
+        if corr not in {"A","B","C","D"}:
+            corr = "A"
+        why  = str(q.get("why","")).strip()
+        fixed_questions.append({"q": qtext, "options": opts, "correct": corr, "why": why})
+
+    data = {"questions": fixed_questions}
 
     # --- формируем markdown сами: варианты в столбик ---
-    qs = json_obj.get("questions") or []
     lines: List[str] = ["🧠 Мини-тест"]
     ABCD = ["A","B","C","D"]
-    for i, q in enumerate(qs, 1):
-        text = (q.get("q") or "").strip()
-        opts = list(q.get("options") or [])
-        lines.append(f"\nВопрос {i}/{len(qs)}:\n{text}")
+    total = len(fixed_questions)
+    for i, q in enumerate(fixed_questions, 1):
+        lines.append(f"\nВопрос {i}/{total}:\n{q['q']}")
         for j, label in enumerate(ABCD):
-            if j < len(opts):
-                opt = str(opts[j]).strip()
-                lines.append(f"{label}) {opt}")
+            lines.append(f"{label}) {q['options'][j]}")
     md = "\n".join(lines).strip()
 
-    return md, json_obj
+    return md, data
 
 # ---------- Картинки ----------
 async def solve_from_image(image_bytes: bytes, hint: str, history: List[Dict[str, str]]) -> str:
+    """
+    Вижн-разбор: аккуратно подсовываем картинку и текст-подсказку.
+    Автовключаем инженерный режим через ENGINEERING_RULES, чтобы раскладывал балки/реакции.
+    """
     data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("utf-8")
 
     extra_eng = (
         "Если на изображении инженерная схема (балка/ферма/нагрузки/опоры): "
-        "1) считать размеры/сектора/обозначения; 2) выписать ΣFy=0, ΣM=0; "
-        "3) найти реакции ЧИСЛАМИ при наличии q, F, M, L; "
-        "4) если данных мало — кратко спросить недостающее; "
+        "1) распознай размеры/обозначения; 2) выпиши ΣFy=0, ΣM=0; "
+        "3) найди реакции ЧИСЛАМИ при наличии q, F, M, L; "
+        "4) если данных мало — кратко спроси недостающее; "
         "5) итог с единицами. "
     )
 
@@ -277,7 +334,7 @@ async def solve_from_image(image_bytes: bytes, hint: str, history: List[Dict[str
         {"role": "system", "content": ENGINEERING_RULES},
     ]
     if history:
-        messages.extend(history)
+        messages.extend(_compact_history(history))
     messages.append({
         "role": "user",
         "content": [
