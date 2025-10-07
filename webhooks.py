@@ -119,6 +119,9 @@ async def _notify_user(chat_id: int, text: str):
 # ---------- lifespan: создаём/закрываем bot/dispatcher корректно ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # локальный импорт, чтобы избежать NameError/циклических импортов
+    from handlers import router as handlers_router
+
     # отдельная aiohttp-сессия с таймаутом (иначе может зависать)
     session = AiohttpSession(timeout=120)
     bot = Bot(token=BOT_TOKEN, session=session)
