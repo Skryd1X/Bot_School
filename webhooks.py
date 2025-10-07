@@ -1,10 +1,12 @@
+# webhooks.py
 import os
 import logging
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
 import json
 import asyncio
 import httpx
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
 from db import set_subscription, db  # db для идемпотентности
 
@@ -20,9 +22,9 @@ log = logging.getLogger("webhooks")
 
 # ----------- ENV -----------
 BOT_TOKEN             = os.getenv("BOT_TOKEN", "")
-PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # например: https://bot-school-bkjs.onrender.com
+PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # напр.: https://your-app.onrender.com
 TELEGRAM_WEBHOOK_PATH = os.getenv("TELEGRAM_WEBHOOK_PATH", "/webhook/telegram")
-TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_WEBHOOK_SECRET", "change-me-please")  # любой длинный секрет
+TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_WEBHOOK_SECRET", "change-me-please")
 NOTIFY_ON_PAYMENT     = os.getenv("NOTIFY_ON_PAYMENT", "false").lower() == "true"
 
 TRIBUTE_API_KEY       = os.getenv("TRIBUTE_API_KEY", "")
@@ -109,7 +111,7 @@ def _extract(data: dict):
     return event_id, is_test, status, paid, amount, currency, startapp, telegram_user_id
 
 async def _notify_user(chat_id: int, text: str):
-    """Лёгкое уведомление через Bot API, если включено NOTIFY_ON_PAYMENT."""
+    """Лёгкое уведомление через Bot API, если включено NOTIFY_ON_PAYMENT (без aiogram)."""
     if not (NOTIFY_ON_PAYMENT and BOT_TOKEN):
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -121,6 +123,11 @@ async def _notify_user(chat_id: int, text: str):
         except Exception as e:
             log.warning("notify fail: %s", e)
 
+# ========= Health =========
+@app.get("/health")
+async def health():
+    return _ok({"health": "ok"})
+
 # ========= Telegram webhook =========
 @app.on_event("startup")
 async def _setup_tg_webhook():
@@ -129,7 +136,7 @@ async def _setup_tg_webhook():
         return
     url = f"{PUBLIC_BASE_URL}{TELEGRAM_WEBHOOK_PATH}"
     try:
-        # удаляем возможный старый вебхук и ставим наш с секретом
+        # снести старый и поставить новый с секретом
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_webhook(url=url, secret_token=TELEGRAM_SECRET_TOKEN, drop_pending_updates=True)
         me = await bot.get_me()
@@ -137,6 +144,18 @@ async def _setup_tg_webhook():
     except Exception as e:
         log.error("Failed to set Telegram webhook: %s", e)
         raise
+
+# 👉 корректное закрытие при остановке (исправляет Unclosed client session)
+@app.on_event("shutdown")
+async def _shutdown_tg():
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
 
 @app.post(TELEGRAM_WEBHOOK_PATH)
 async def telegram_handler(request: Request):
@@ -153,7 +172,6 @@ async def telegram_handler(request: Request):
 # ========= Tribute webhook =========
 @app.get("/webhook/tribute")
 async def tribute_ping():
-    """Пинг для тестовой кнопки в Tribute/NGROK."""
     return _ok({"ping": True})
 
 @app.post("/webhook/tribute")
@@ -176,11 +194,11 @@ async def tribute_webhook(request: Request):
         startapp, telegram_user_id
     ) = _extract(data)
 
-    # 3) Игнорируем тестовые события/пинги
+    # 3) Игнор тестов/пингов
     if is_test or data.get("event") in {"test", "ping"}:
         return _ok({"ignored": "test"})
 
-    # 4) Жёсткие условия «только реальная оплата»
+    # 4) Только успешные платежи
     if not paid:
         return _ok({"ignored": "not_paid"})
     if amount <= 0:
