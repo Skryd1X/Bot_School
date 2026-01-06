@@ -1,4 +1,3 @@
-# startbot.py — единый вход: polling (по умолчанию) или webhook, + опционально вебхук Tribute
 import os
 import asyncio
 import logging
@@ -7,92 +6,132 @@ import contextlib
 from dotenv import load_dotenv
 
 load_dotenv()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("start")
 
-# --------- ENV ---------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-# Режим работы:
-#   MODE=polling   — локально (дефолт)
-#   MODE=webhook   — только веб-приложение (Render)
-MODE = os.getenv("MODE", "polling").strip().lower()
+MODE = (os.getenv("MODE") or "polling").strip().lower()
 
-# Tribute webhook (FastAPI) — поднимаем параллельно при polling, или единственным процессом при MODE=webhook
-USE_TRIBUTE = os.getenv("USE_TRIBUTE", "false").lower() == "true"
-RUN_TRIBUTE_WEBHOOK = os.getenv("RUN_TRIBUTE_WEBHOOK", "false").lower() == "true"
+USE_TRIBUTE = (os.getenv("USE_TRIBUTE") or "false").lower() == "true"
+RUN_TRIBUTE_WEBHOOK = (os.getenv("RUN_TRIBUTE_WEBHOOK") or "false").lower() == "true"
 
-WEBHOOK_HOST = "0.0.0.0"
-WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8080"))  # Render кладёт порт в PORT
+WEBHOOK_HOST = (os.getenv("WEBHOOK_HOST") or "0.0.0.0").strip()
+WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT") or "8080")
 
-# --------- POLLING (Aiogram) ---------
+
+def _want_webhook_server() -> bool:
+    if MODE == "webhook":
+        return True
+    if MODE in {"both", "hybrid"}:
+        return True
+    return bool(USE_TRIBUTE and RUN_TRIBUTE_WEBHOOK)
+
+
+def _want_polling() -> bool:
+    if MODE == "webhook":
+        return False
+    if MODE in {"polling", "both", "hybrid"}:
+        return True
+    return True
+
+
 async def run_polling():
     from aiogram import Bot, Dispatcher
     from aiogram.fsm.storage.memory import MemoryStorage
     from aiogram.client.session.aiohttp import AiohttpSession
     from handlers import router
 
-    # таймаут обычным числом (секунды)
     session = AiohttpSession(timeout=120)
     bot = Bot(token=BOT_TOKEN, session=session)
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # На всякий: если когда-то включался webhook — сняем его (иначе будет конфликт).
     with contextlib.suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
 
     me = await bot.get_me()
-    log.info("Start polling for bot @%s (id=%s)", me.username, me.id)
+    log.info("Polling started: @%s (id=%s)", me.username, me.id)
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await bot.session.close()
+        with contextlib.suppress(Exception):
+            await bot.session.close()
 
-# --------- Tribute webhook (FastAPI via Uvicorn) ---------
-async def run_tribute_server():
-    # Запускаем uvicorn с приложением из webhooks.py
+
+async def run_webhook_server():
     import uvicorn
-    from webhooks import app as tribute_app
+    from webhooks import app
 
     config = uvicorn.Config(
-        app=tribute_app,
+        app=app,
         host=WEBHOOK_HOST,
         port=WEBHOOK_PORT,
         log_level="info",
+        access_log=False,
     )
     server = uvicorn.Server(config)
-    log.info("Starting Tribute webhook on http://%s:%s", WEBHOOK_HOST, WEBHOOK_PORT)
-    await server.serve()
 
-# --------- orchestrator ---------
-async def main():
-    if MODE == "webhook":
-        # Только веб-приложение (обычно для Render).
-        # В этом режиме Aiogram polling не стартуем.
-        if not (USE_TRIBUTE or RUN_TRIBUTE_WEBHOOK):
-            log.warning("MODE=webhook, но USE_TRIBUTE/RUN_TRIBUTE_WEBHOOK выключены — нечего запускать.")
-        await run_tribute_server()
-        return
+    log.info("Webhook server starting on http://%s:%s", WEBHOOK_HOST, WEBHOOK_PORT)
+    try:
+        await server.serve()
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            server.should_exit = True
+        raise
 
-    # MODE=polling — локальная разработка по умолчанию
-    tasks = [asyncio.create_task(run_polling())]
 
-    # Параллельно можно поднять Tribute webhook (например, тестировать оплаты локально через туннель)
-    if USE_TRIBUTE and RUN_TRIBUTE_WEBHOOK:
-        tasks.append(asyncio.create_task(run_tribute_server()))
-
-    # Ждём завершения любой задачи
+async def _run_until_first_exception(tasks: list[asyncio.Task]):
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-    # Если что-то упало — отменяем остальные
+
+    exc: BaseException | None = None
+    for t in done:
+        with contextlib.suppress(asyncio.CancelledError):
+            e = t.exception()
+            if e:
+                exc = e
+                break
+
     for t in pending:
         t.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+    for t in pending:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await t
+
+    if exc:
+        raise exc
+
+
+async def main():
+    log.info(
+        "Mode=%s | polling=%s | webhook_server=%s | tribute=%s",
+        MODE,
+        _want_polling(),
+        _want_webhook_server(),
+        "on" if USE_TRIBUTE else "off",
+    )
+
+    if MODE == "webhook" and not (USE_TRIBUTE or RUN_TRIBUTE_WEBHOOK):
+        log.warning("MODE=webhook, but USE_TRIBUTE/RUN_TRIBUTE_WEBHOOK are disabled")
+
+    tasks: list[asyncio.Task] = []
+
+    if _want_polling():
+        tasks.append(asyncio.create_task(run_polling(), name="polling"))
+
+    if _want_webhook_server():
+        tasks.append(asyncio.create_task(run_webhook_server(), name="webhook_server"))
+
+    if not tasks:
+        raise RuntimeError("Nothing to run: check MODE/USE_TRIBUTE/RUN_TRIBUTE_WEBHOOK")
+
+    await _run_until_first_exception(tasks)
+
 
 if __name__ == "__main__":
     try:

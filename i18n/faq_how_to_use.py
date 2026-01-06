@@ -1,0 +1,197 @@
+from . import pick_lang
+
+_HOW: dict[str, str] = {
+    "ru": (
+        "<b>Как пользоваться uStudy</b>\n\n"
+        "1) <b>Задача текстом</b>\n"
+        "Просто напишите вопрос. Я отвечу кратко, затем объясню по шагам.\n\n"
+        "2) <b>Задача с фото</b>\n"
+        "Пришлите фото/скрин. Я распознаю условие и разберу решение.\n\n"
+        "3) <b>Тип работы бота</b>\n"
+        "⚙️ Настройки → 🎛 Тип работы бота — выберите стиль: подсказки, полный разбор, конспект, тест и т.д.\n\n"
+        "4) <b>Режим Учителя</b>\n"
+        "В PRO можно включить 👩‍🏫 Учителя: интуиция, шаги, типичные ошибки и мини-проверка.\n\n"
+        "5) <b>Озвучка</b>\n"
+        "В PRO доступны кнопка 🎙 Озвучить и авто-озвучка в настройках.\n\n"
+        "6) <b>PDF</b>\n"
+        "В PRO можно экспортировать разбор в PDF.\n\n"
+        "7) <b>Мини-тест</b>\n"
+        "В PRO — «🧠 Проверить себя»: короткий тест по последнему разбору.\n\n"
+        "8) <b>Язык</b>\n"
+        "🌐 Язык бота — меняет интерфейс и ответы.\n"
+    ),
+    "en": (
+        "<b>How to use uStudy</b>\n\n"
+        "1) <b>Text question</b>\n"
+        "Type your question. I’ll give a short summary and then explain step by step.\n\n"
+        "2) <b>Photo task</b>\n"
+        "Send a photo/screenshot. I’ll read the task and solve it clearly.\n\n"
+        "3) <b>Bot mode</b>\n"
+        "⚙️ Settings → 🎛 Bot mode — choose: hints only, full solution, notes, tests, etc.\n\n"
+        "4) <b>Teacher mode</b>\n"
+        "PRO includes 👩‍🏫 Teacher mode: intuition, steps, common mistakes, mini-check.\n\n"
+        "5) <b>Voice</b>\n"
+        "PRO has 🎙 Voice button and optional auto-voice in settings.\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO can export the last answer as PDF.\n\n"
+        "7) <b>Mini-quiz</b>\n"
+        "PRO: “🧠 Check yourself” creates a short quiz from your last solution.\n\n"
+        "8) <b>Language</b>\n"
+        "🌐 Bot language changes both UI and answers.\n"
+    ),
+    "uz": (
+        "<b>uStudy’dan foydalanish</b>\n\n"
+        "1) <b>Matn bilan savol</b>\n"
+        "Savolingizni yozing. Avval qisqa xulosa, so‘ng bosqichma-bosqich tushuntiraman.\n\n"
+        "2) <b>Rasm orqali masala</b>\n"
+        "Foto/skrin yuboring. Shartni o‘qib, aniq yechib beraman.\n\n"
+        "3) <b>Bot rejimi</b>\n"
+        "⚙️ Sozlamalar → 🎛 Bot rejimi — faqat maslahatlar, to‘liq yechim, konspekt, test va boshqalar.\n\n"
+        "4) <b>O‘qituvchi rejimi</b>\n"
+        "PRO’da 👩‍🏫 O‘qituvchi: intuisiya, qadamlar, xatolar va mini-tekshiruv.\n\n"
+        "5) <b>Ovoz</b>\n"
+        "PRO’da 🎙 Ovoz tugmasi va auto-ovoz sozlamasi bor.\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO’da javobni PDF’ga chiqarish mumkin.\n\n"
+        "7) <b>Mini-test</b>\n"
+        "PRO: «🧠 O‘zingni tekshir» — oxirgi javob bo‘yicha test.\n\n"
+        "8) <b>Til</b>\n"
+        "🌐 Bot tili — interfeys va javoblarni o‘zgartiradi.\n"
+    ),
+    "kk": (
+        "<b>uStudy қалай қолдануға болады</b>\n\n"
+        "1) <b>Мәтінмен сұрақ</b>\n"
+        "Сұрағыңызды жазыңыз. Алдымен қысқа түйін, кейін қадам-қадам түсіндіремін.\n\n"
+        "2) <b>Фото арқылы есеп</b>\n"
+        "Фото/скрин жіберіңіз. Шартты оқып, нақты шығарып беремін.\n\n"
+        "3) <b>Бот режимі</b>\n"
+        "⚙️ Баптаулар → 🎛 Бот режимі — тек ишара, толық шешім, конспект, тест және т.б.\n\n"
+        "4) <b>Мұғалім режимі</b>\n"
+        "PRO-да 👩‍🏫 Мұғалім: интуиция, қадамдар, жиі қате, мини-тексеру.\n\n"
+        "5) <b>Дауыс</b>\n"
+        "PRO-да 🎙 Дауыс батырмасы және авто-дауыс бар.\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO-да жауапты PDF-ке экспорттауға болады.\n\n"
+        "7) <b>Мини-тест</b>\n"
+        "PRO: «🧠 Өзіңді тексер» — соңғы жауап бойынша тест.\n\n"
+        "8) <b>Тіл</b>\n"
+        "🌐 Бот тілі — интерфейс пен жауаптарды өзгертеді.\n"
+    ),
+    "de": (
+        "<b>So nutzt du uStudy</b>\n\n"
+        "1) <b>Frage als Text</b>\n"
+        "Schreibe deine Frage. Erst kurz, dann Schritt für Schritt.\n\n"
+        "2) <b>Aufgabe per Foto</b>\n"
+        "Sende ein Foto/Screenshot. Ich lese die Aufgabe und löse sie verständlich.\n\n"
+        "3) <b>Bot-Modus</b>\n"
+        "⚙️ Einstellungen → 🎛 Bot-Modus — Hinweise, vollständige Lösung, Notizen, Tests usw.\n\n"
+        "4) <b>Lehrer-Modus</b>\n"
+        "PRO: 👩‍🏫 Lehrer-Modus mit Intuition, Schritten, typischen Fehlern, Mini-Check.\n\n"
+        "5) <b>Audio</b>\n"
+        "PRO: 🎙 Audio-Button und optional Auto-Audio.\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO: Export als PDF.\n\n"
+        "7) <b>Mini-Quiz</b>\n"
+        "PRO: „🧠 Check dich selbst“ erstellt ein Quiz zur letzten Lösung.\n\n"
+        "8) <b>Sprache</b>\n"
+        "🌐 Sprache ändert Oberfläche und Antworten.\n"
+    ),
+    "fr": (
+        "<b>Utiliser uStudy</b>\n\n"
+        "1) <b>Question en texte</b>\n"
+        "Écris ta question. Résumé court, puis explication étape par étape.\n\n"
+        "2) <b>Exercice en photo</b>\n"
+        "Envoie une photo/capture. Je lis l’énoncé et je le résous clairement.\n\n"
+        "3) <b>Mode du bot</b>\n"
+        "⚙️ Paramètres → 🎛 Mode du bot — indices, solution complète, notes, test, etc.\n\n"
+        "4) <b>Mode Prof</b>\n"
+        "PRO: 👩‍🏫 mode Prof (intuition, étapes, erreurs fréquentes, mini-vérif).\n\n"
+        "5) <b>Voix</b>\n"
+        "PRO: bouton 🎙 Voix + option auto-voix.\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO: export PDF.\n\n"
+        "7) <b>Mini-quiz</b>\n"
+        "PRO: «🧠 Se tester» pour un quiz sur la dernière réponse.\n\n"
+        "8) <b>Langue</b>\n"
+        "🌐 La langue change l’interface et les réponses.\n"
+    ),
+    "es": (
+        "<b>Cómo usar uStudy</b>\n\n"
+        "1) <b>Pregunta en texto</b>\n"
+        "Escribe tu pregunta. Resumen breve y luego pasos claros.\n\n"
+        "2) <b>Ejercicio con foto</b>\n"
+        "Envía una foto/captura. Leo el enunciado y lo resuelvo.\n\n"
+        "3) <b>Modo del bot</b>\n"
+        "⚙️ Ajustes → 🎛 Modo del bot — pistas, solución completa, apuntes, test, etc.\n\n"
+        "4) <b>Modo Profesor</b>\n"
+        "PRO: 👩‍🏫 profesor (intuición, pasos, errores típicos, mini-chequeo).\n\n"
+        "5) <b>Voz</b>\n"
+        "PRO: botón 🎙 Voz y opción de voz automática.\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO: exportar a PDF.\n\n"
+        "7) <b>Mini-test</b>\n"
+        "PRO: «🧠 Compruébate» crea un test del último tema.\n\n"
+        "8) <b>Idioma</b>\n"
+        "🌐 El idioma cambia interfaz y respuestas.\n"
+    ),
+    "tr": (
+        "<b>uStudy nasıl kullanılır</b>\n\n"
+        "1) <b>Metinle soru</b>\n"
+        "Sorunu yaz. Kısa özet, sonra adım adım anlatım.\n\n"
+        "2) <b>Fotoğraflı soru</b>\n"
+        "Foto/screenshot gönder. Soruyu okuyup net çözerim.\n\n"
+        "3) <b>Bot modu</b>\n"
+        "⚙️ Ayarlar → 🎛 Bot modu — sadece ipucu, tam çözüm, not, test vb.\n\n"
+        "4) <b>Öğretmen modu</b>\n"
+        "PRO: 👩‍🏫 öğretmen modu (sezgi, adımlar, sık hatalar, mini kontrol).\n\n"
+        "5) <b>Ses</b>\n"
+        "PRO: 🎙 Ses düğmesi + otomatik ses seçeneği.\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO: PDF dışa aktarım.\n\n"
+        "7) <b>Mini test</b>\n"
+        "PRO: «🧠 Kendini kontrol et» — son yanıttan test.\n\n"
+        "8) <b>Dil</b>\n"
+        "🌐 Dil, arayüzü ve cevapları değiştirir.\n"
+    ),
+    "ar": (
+        "<b>كيفية استخدام uStudy</b>\n\n"
+        "1) <b>سؤال نصّي</b>\n"
+        "اكتب سؤالك. سأعطي ملخّصًا قصيرًا ثم شرحًا خطوة بخطوة.\n\n"
+        "2) <b>مسألة بالصور</b>\n"
+        "أرسل صورة/لقطة شاشة. سأقرأ المسألة وأحلّها بشكل واضح.\n\n"
+        "3) <b>وضع البوت</b>\n"
+        "⚙️ الإعدادات → 🎛 وضع البوت — تلميحات فقط، حل كامل، ملخّص، اختبار…\n\n"
+        "4) <b>وضع المعلّم</b>\n"
+        "PRO: 👩‍🏫 شرح مبسّط، خطوات، أخطاء شائعة، واختبار صغير.\n\n"
+        "5) <b>الصوت</b>\n"
+        "PRO: زر 🎙 للصوت وخيار صوت تلقائي.\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO: تصدير الإجابة إلى PDF.\n\n"
+        "7) <b>اختبار قصير</b>\n"
+        "PRO: «🧠 اختبر نفسك» — اختبار من آخر شرح.\n\n"
+        "8) <b>اللغة</b>\n"
+        "🌐 تغيير اللغة يغيّر الواجهة والإجابات.\n"
+    ),
+    "hi": (
+        "<b>uStudy कैसे इस्तेमाल करें</b>\n\n"
+        "1) <b>टेक्स्ट सवाल</b>\n"
+        "अपना सवाल लिखें। पहले छोटा सार, फिर चरण-दर-चरण समझाऊँगा।\n\n"
+        "2) <b>फोटो वाला प्रश्न</b>\n"
+        "फोटो/स्क्रीनशॉट भेजें। मैं प्रश्न पढ़कर स्पष्ट समाधान दूँगा।\n\n"
+        "3) <b>बॉट मोड</b>\n"
+        "⚙️ सेटिंग्स → 🎛 बॉट मोड — केवल संकेत, पूरा समाधान, नोट्स, टेस्ट आदि।\n\n"
+        "4) <b>टीचर मोड</b>\n"
+        "PRO: 👩‍🏫 टीचर मोड (इंट्यूशन, स्टेप्स, सामान्य गलतियाँ, मिनी-चेक)।\n\n"
+        "5) <b>वॉयस</b>\n"
+        "PRO: 🎙 वॉयस बटन और ऑटो-वॉयस विकल्प।\n\n"
+        "6) <b>PDF</b>\n"
+        "PRO: PDF एक्सपोर्ट।\n\n"
+        "7) <b>मिनी टेस्ट</b>\n"
+        "PRO: «🧠 खुद को जाँचें» — पिछले उत्तर से टेस्ट।\n\n"
+        "8) <b>भाषा</b>\n"
+        "🌐 भाषा बदलने से इंटरफ़ेस और उत्तर बदलते हैं।\n"
+    ),
+}
+
+def get_how_to_use(lang: str | None) -> str:
+    return pick_lang(lang, _HOW)

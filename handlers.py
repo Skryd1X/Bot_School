@@ -1,4 +1,3 @@
-# handlers.py
 import os
 import asyncio
 import time
@@ -21,24 +20,22 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.enums import ChatAction, ParseMode
-from aiogram.utils.keyboard import InlineKeyboardBuilder  # <- для кнопок теста
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from generators import stream_response_text, solve_from_image, quiz_from_answer
 from db import (
     ensure_user, can_use, inc_usage, get_status_text,
     get_all_chat_ids, drop_chat, set_optin,
-    # prefs / voice
     get_prefs, get_pref_bool, set_pref,
     get_voice_settings, set_voice_settings,
     is_teacher_mode, set_teacher_mode,
     get_priority, set_priority,
     get_answer_style, set_answer_style,
-    # history & bookmarks
     add_history, get_history, clear_history,
     remember_bookmark, forget_last_bookmark, get_last_bookmark,
-    # рефералка
     get_or_create_ref_code, get_referral_stats,
     find_user_by_ref_code, set_referrer_once,
+    apply_promocode_access,
 )
 
 from utils_export import pdf_from_answer_text
@@ -46,38 +43,328 @@ from tts import tts_voice_ogg, split_for_tts
 
 router = Router()
 
-# ---------- Константы/окружение ----------
-COOLDOWN_SECONDS   = 5
-MIN_INTERVAL_SEND  = 1.1
-MIN_EDIT_INTERVAL  = 0.25
-MAX_TG_LEN         = 4096
+COOLDOWN_SECONDS = 5
+MIN_INTERVAL_SEND = 1.1
+MIN_EDIT_INTERVAL = 0.25
+MAX_TG_LEN = 4096
 
 TRIBUTE_LITE_STARTAPP = os.getenv("TRIBUTE_LITE_STARTAPP", "")
-TRIBUTE_PRO_STARTAPP  = os.getenv("TRIBUTE_PRO_STARTAPP", "")
-TRIBUTE_LITE_PRICE    = os.getenv("TRIBUTE_LITE_PRICE", "200")
-TRIBUTE_PRO_PRICE     = os.getenv("TRIBUTE_PRO_PRICE", "300")
+TRIBUTE_PRO_STARTAPP = os.getenv("TRIBUTE_PRO_STARTAPP", "")
+TRIBUTE_LITE_PRICE = os.getenv("TRIBUTE_LITE_PRICE", "200")
+TRIBUTE_PRO_PRICE = os.getenv("TRIBUTE_PRO_PRICE", "300")
+PROMO_CODE = os.getenv("PROMO_CODE", "uStudyPromoTest").strip()
+PROMO_PRO_DAYS = int(os.getenv("PROMO_PRO_DAYS", "365"))
 
-# Рефералка
-BOT_USERNAME          = os.getenv("BOT_USERNAME", "your_bot").lstrip("@")  # без @
-REF_BONUS_THRESHOLD   = int(os.getenv("REF_BONUS_THRESHOLD", "6"))         # каждые N оплат = +1 месяц PRO
 
-# Параметры TTS
+BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot").lstrip("@")
+REF_BONUS_THRESHOLD = int(os.getenv("REF_BONUS_THRESHOLD", "6"))
+
 TTS_ENABLED_DEFAULT_PRO = False
 TTS_CHUNK_LIMIT = 2500
+
+# ----------------- ЯЗЫК / I18N -----------------
+
+LANGUAGES: Dict[str, str] = {
+    "ru": "Русский",
+    "en": "English",
+    "uz": "Oʻzbek",
+    "kk": "Қазақша",
+    "de": "Deutsch",
+    "fr": "Français",
+    "es": "Español",
+    "tr": "Türkçe",
+    "ar": "العربية",
+    "hi": "हिन्दी",
+}
+
+LANG_BUTTONS: Dict[str, str] = {
+    "🇷🇺 Русский": "ru",
+    "🇬🇧 English": "en",
+    "🇺🇿 Oʻzbek": "uz",
+    "🇰🇿 Қазақша": "kk",
+    "🇩🇪 Deutsch": "de",
+    "🇫🇷 Français": "fr",
+    "🇪🇸 Español": "es",
+    "🇹🇷 Türkçe": "tr",
+    "🇦🇪 العربية": "ar",
+    "🇮🇳 हिन्दी": "hi",
+}
+
+LANGUAGE_HINTS: Dict[str, str] = {
+    "ru": "Всегда отвечай пользователю только на русском языке, если он явно не просит другой язык.",
+    "en": "Always respond to the user only in English unless they explicitly ask for another language.",
+    "uz": "Always respond to the user only in Uzbek unless they explicitly ask for another language.",
+    "kk": "Always respond to the user only in Kazakh unless they explicitly ask for another language.",
+    "de": "Always respond to the user only in German unless they explicitly ask for another language.",
+    "fr": "Always respond to the user only in French unless they explicitly ask for another language.",
+    "es": "Always respond to the user only in Spanish unless they explicitly ask for another language.",
+    "tr": "Always respond to the user only in Turkish unless they explicitly ask for another language.",
+    "ar": "Always respond to the user only in Arabic unless they explicitly ask for another language.",
+    "hi": "Always respond to the user only in Hindi unless they explicitly ask for another language.",
+}
+
+DEFAULT_LANG = "ru"
+
+LANG_SELECT_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="🇷🇺 Русский"),
+            KeyboardButton(text="🇬🇧 English"),
+        ],
+        [
+            KeyboardButton(text="🇺🇿 Oʻzbek"),
+            KeyboardButton(text="🇰🇿 Қазақша"),
+        ],
+        [
+            KeyboardButton(text="🇩🇪 Deutsch"),
+            KeyboardButton(text="🇫🇷 Français"),
+        ],
+        [
+            KeyboardButton(text="🇪🇸 Español"),
+            KeyboardButton(text="🇹🇷 Türkçe"),
+        ],
+        [
+            KeyboardButton(text="🇦🇪 العربية"),
+            KeyboardButton(text="🇮🇳 हिन्दी"),
+        ],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="🌐 Choose language / Выберите язык…",
+)
+
+async def get_user_lang(chat_id: int) -> str:
+    prefs = await get_prefs(chat_id)
+    lang = (prefs or {}).get("lang")
+    if isinstance(lang, str) and lang in LANGUAGES:
+        return lang
+    return DEFAULT_LANG
+
+async def ensure_language_selected(message: Message) -> Optional[str]:
+    """
+    Проверяем, выбран ли язык. Если нет — просим выбрать и НЕ продолжаем обработку.
+    """
+    prefs = await get_prefs(message.chat.id)
+    lang = (prefs or {}).get("lang")
+    if isinstance(lang, str) and lang in LANGUAGES:
+        return lang
+    await message.answer(
+        "🌐 Выберите язык бота (интерфейс + ответы).\n"
+        "Choose the bot language (interface + answers).",
+        reply_markup=LANG_SELECT_KB,
+    )
+    return None
+
+def build_greeting(lang: str, is_free: bool, mode_title: str) -> str:
+    if lang == "en":
+        return (
+            "👋 Hi! I'm a study assistant for school and university.\n\n"
+            "What I can do:\n"
+            "• Solve problems step by step (math, physics, etc.)\n"
+            "• Explain theory in simple words\n"
+            "• Write essays, outlines and reports\n"
+            "• Help with code and formatting of solutions\n"
+            "• Understand photos/screenshots of tasks 📷\n\n"
+            "How to start:\n"
+            "— Send a photo of the task or describe it in text.\n"
+            "— Need help? Tap “FAQ / Help”.\n"
+            f"— {'Upgrade plan — button below.' if is_free else 'Access status — “🧾 My subscriptions”.'}\n"
+            "— 🎁 Friends bonus: invite friends and get PRO.\n\n"
+            f"Current bot mode: {mode_title}\n"
+            "You can change it in ⚙️ Settings → 🎛 Bot mode."
+        )
+    # default Russian
+    return (
+        "👋 Привет! Я — учебный помощник для школы и вузов.\n\n"
+        "Что я умею:\n"
+        "• Разбирать задачи по шагам (математика, физика и др.)\n"
+        "• Пояснять теорию простым языком\n"
+        "• Писать сочинения, эссе, конспекты, рефераты\n"
+        "• Помогать с кодом и оформлением решений\n"
+        "• Понимать фото/скриншоты задач 📷\n\n"
+        "Как начать:\n"
+        "— Пришли фото задачи или напиши текстом, что нужно.\n"
+        "— Нужна справка — жми «FAQ / Помощь».\n"
+        f"— {'Обновить план — кнопка ниже.' if is_free else 'Статус доступа — «🧾 Мои подписки».'}\n"
+        "— 🎁 Бонус за друзей: пригласи друзей и получай PRO.\n\n"
+        f"Текущий тип работы бота: {mode_title}\n"
+        "Изменить можно в ⚙️ Настройки → 🎛 Тип работы бота."
+    )
+
+# ----------------- РЕЖИМЫ БОТА -----------------
+
+BOT_MODES: Dict[str, Dict[str, str]] = {
+    "default": {
+        "title": "👨‍🏫 Нормальный учитель",
+        "description": "Классический режим: структурные объяснения, примеры и аккуратный разбор задач.",
+        "prompt": "",
+    },
+    "simple": {
+        "title": "🧸 Объяснять по-простому",
+        "description": "Объяснения максимально простым языком, с аналогиями из жизни и короткими пояснениями.",
+        "prompt": (
+            "Объясняй материал максимально простым и понятным языком, как для 10-летнего ребёнка. "
+            "Избегай сложной терминологии, используй аналогии из повседневной жизни и короткие предложения. "
+            "Если тема сложная, сначала дай интуитивное объяснение, а затем можешь добавить чуть больше деталей."
+        ),
+    },
+    "coach": {
+        "title": "🎯 Коучинг вопросами",
+        "description": "Не даёт готовое решение сразу, а ведёт ученика вопросами и подсказками.",
+        "prompt": (
+            "Работай в коучинговом сократическом режиме. Не давай сразу готовое решение. "
+            "Разбей задачу на шаги и в ответе сначала задай 2–4 наводящих вопроса, которые помогут пользователю "
+            "самому продвинуться. При необходимости можно добавить короткие подсказки, но полный разбор решения "
+            "оставь на отдельный явный запрос пользователя."
+        ),
+    },
+    "exam": {
+        "title": "📝 Экзаменатор",
+        "description": "Фокус на проверочных вопросах и оценке знаний, а не на длинных лекциях.",
+        "prompt": (
+            "Работай как экзаменатор. По запросу формируй 3–7 проверочных вопросов по теме, чтобы оценить знания "
+            "пользователя. Сначала выдай вопросы без подробных решений. К каждому вопросу можно дать очень короткий "
+            "комментарий. Полные разборы и решения показывай только по отдельному запросу."
+        ),
+    },
+    "solve_full": {
+        "title": "📐 Решение задач с объяснением",
+        "description": "Полный разбор задач: переписать условие, план решения, шаги и итог.",
+        "prompt": (
+            "Если запрос похож на задачу, сначала коротко перепиши условие своими словами, затем обозначь план решения "
+            "(1–3 шага), после этого реши по шагам с пояснениями и в конце подведи итог, почему результат логичен. "
+            "Если запрос не является задачей, отвечай как обычно, но по возможности тоже структурировано."
+        ),
+    },
+    "hint": {
+        "title": "💡 Только подсказки",
+        "description": "Делает упор на намёки и направление мысли, без полного решения.",
+        "prompt": (
+            "Давай только подсказки к решению задачи, а не полное решение. В ответе укажи 2–4 шага-намёка: "
+            "какие понятия вспомнить, какую формулу применить, какие величины найти. Не пиши окончательный ответ, "
+            "пока пользователь явно не попросит показать полное решение."
+        ),
+    },
+    "check": {
+        "title": "✅ Проверка моего решения",
+        "description": "Проверяет уже сделанное решение ученика, показывает ошибки и улучшения.",
+        "prompt": (
+            "Считай, что пользователь присылает своё решение задачи. Не решай задачу с нуля. "
+            "Сначала оцени, верен ли итоговый ответ, затем покажи, на каких шагах есть ошибки или сомнительные места. "
+            "Предложи улучшенную или исправленную версию решения и дай 1–2 совета, как в будущем избегать таких ошибок."
+        ),
+    },
+    "notes": {
+        "title": "📓 Конспект по теме",
+        "description": "Преобразует запрос в структурированный учебный конспект.",
+        "prompt": (
+            "Преобразуй запрос пользователя в структурированный учебный конспект. "
+            "Структура: краткое введение, основные определения и формулы, ключевые идеи, "
+            "2–3 типовых примера и небольшой блок вопросов для самопроверки в конце."
+        ),
+    },
+    "test": {
+        "title": "🧪 Генератор тестов",
+        "description": "Создаёт небольшой тест по теме с ответами и разбором.",
+        "prompt": (
+            "Сгенерируй небольшой учебный тест по теме из запроса. Сделай 5–10 вопросов разных типов "
+            "(выбор ответа, краткий ответ). В первой части ответа перечисли вопросы без ответов, "
+            "а во второй части перечисли правильные ответы и краткий разбор по каждому вопросу."
+        ),
+    },
+    "cards": {
+        "title": "🎴 Карточки по теме",
+        "description": "Делает набор учебных flashcards: вопрос/ответ.",
+        "prompt": (
+            "Сделай набор учебных карточек (flashcards) по теме из запроса. "
+            "Для каждой карточки укажи: сторона A — вопрос или термин, сторона B — краткое объяснение, формула или ответ. "
+            "Сделай 8–20 карточек, если явно не указано другое количество."
+        ),
+    },
+    "cheatsheet": {
+        "title": "📌 Шпаргалка",
+        "description": "Максимально компактная шпаргалка: формулы и ключевые тезисы.",
+        "prompt": (
+            "Сделай максимально компактную шпаргалку по теме из запроса. "
+            "Только ключевые формулы, определения и 3–7 самых важных тезисов. Без лишней воды."
+        ),
+    },
+    "mindmap": {
+        "title": "🧠 Mind-map по теме",
+        "description": "Строит текстовую mind-map: тема → ветки → подветки.",
+        "prompt": (
+            "Построй текстовую mind-map по теме из запроса. "
+            "Сначала укажи центральную тему, затем ветки первого уровня с подветками. "
+            "Используй вложенные маркеры, чтобы было понятно, что к чему относится."
+        ),
+    },
+    "study_plan": {
+        "title": "📅 Учебный план по теме",
+        "description": "Составляет персональный учебный план по теме.",
+        "prompt": (
+            "Составь персональный учебный план по теме из запроса. "
+            "Если явно не указаны сроки и доступное время, сделай разумные предположения и обозначь их в начале ответа. "
+            "Разбей план по дням или неделям, укажи, что изучать, какие задачи решать и как проверять прогресс."
+        ),
+    },
+}
+
+MODE_BUTTON_TEXT_TO_KEY: Dict[str, str] = {
+    "👨‍🏫 Нормальный учитель": "default",
+    "🧸 Объяснять по-простому": "simple",
+    "🎯 Коучинг вопросами": "coach",
+    "📝 Экзаменатор": "exam",
+    "📐 Решение задач с объяснением": "solve_full",
+    "💡 Только подсказки": "hint",
+    "✅ Проверка моего решения": "check",
+    "📓 Конспект по теме": "notes",
+    "🧪 Генератор тестов": "test",
+    "🎴 Карточки по теме": "cards",
+    "📌 Шпаргалка": "cheatsheet",
+    "🧠 Mind-map по теме": "mindmap",
+    "📅 Учебный план по теме": "study_plan",
+}
 
 def tribute_url(code: str) -> str:
     return f"https://t.me/tribute/app?startapp={code}"
 
-# ---------- План/клавиатуры ----------
+async def get_current_mode(chat_id: int) -> str:
+    prefs = await get_prefs(chat_id)
+    mode = (prefs or {}).get("mode")
+    if mode in BOT_MODES:
+        return mode
+    return "default"
+
+async def set_current_mode(chat_id: int, mode: str) -> None:
+    key = mode if mode in BOT_MODES else "default"
+    await set_pref(chat_id, "mode", key)
+
+async def apply_mode_to_text(chat_id: int, text: str) -> str:
+    """
+    Добавляем к запросу промпт выбранного режима И языковой хинт.
+    """
+    mode = await get_current_mode(chat_id)
+    cfg = BOT_MODES.get(mode) or BOT_MODES["default"]
+    prompt = cfg.get("prompt") or ""
+    lang = await get_user_lang(chat_id)
+    lang_hint = LANGUAGE_HINTS.get(lang, "")
+    parts: List[str] = []
+    if lang_hint:
+        parts.append(lang_hint)
+    if prompt:
+        parts.append(prompt)
+    if not parts:
+        return text
+    return "\n\n".join(parts) + "\n\n" + text
+
 async def _plan_flags(chat_id: int) -> Tuple[bool, bool, bool]:
-    """return (is_free, is_lite, is_pro)"""
     t = (await get_status_text(chat_id)).lower()
     return ("план: free" in t, "план: lite" in t, "план: pro" in t)
 
 def plans_kb(show_back: bool = False) -> InlineKeyboardMarkup:
     row = [
         InlineKeyboardButton(text=f"🪙 LITE {TRIBUTE_LITE_PRICE} ₽", url=tribute_url(TRIBUTE_LITE_STARTAPP)),
-        InlineKeyboardButton(text=f"🚀 PRO {TRIBUTE_PRO_PRICE} ₽",  url=tribute_url(TRIBUTE_PRO_STARTAPP)),
+        InlineKeyboardButton(text=f"🚀 PRO {TRIBUTE_PRO_PRICE} ₽", url=tribute_url(TRIBUTE_PRO_STARTAPP)),
     ]
     kb: list[list[InlineKeyboardButton]] = [row]
     if show_back:
@@ -104,18 +391,18 @@ def main_kb_for_plan(is_free: bool) -> ReplyKeyboardMarkup:
     if is_free:
         keyboard = [
             [KeyboardButton(text="🔼 Обновить план"), KeyboardButton(text="FAQ / Помощь")],
-            [KeyboardButton(text="⚙️ Настройки"),     KeyboardButton(text="🎁 Бонус за друзей")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="🎁 Бонус за друзей")],
         ]
     else:
         keyboard = [
-            [KeyboardButton(text="🧾 Мои подписки"),  KeyboardButton(text="FAQ / Помощь")],
-            [KeyboardButton(text="⚙️ Настройки"),     KeyboardButton(text="🎁 Бонус за друзей")],
+            [KeyboardButton(text="🧾 Мои подписки"), KeyboardButton(text="FAQ / Помощь")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="🎁 Бонус за друзей")],
         ]
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Напишите вопрос или пришлите фото…",
+        input_field_placeholder="Напишите вопрос или пришлите фото… / Type a question or send a photo…",
     )
 
 SETTINGS_KB = ReplyKeyboardMarkup(
@@ -123,22 +410,32 @@ SETTINGS_KB = ReplyKeyboardMarkup(
         [KeyboardButton(text="🔔 Включить авто-озвучку"), KeyboardButton(text="🔕 Выключить авто-озвучку")],
         [KeyboardButton(text="👩‍🏫 Включить режим Учителя"), KeyboardButton(text="👨‍🎓 Выключить режим Учителя")],
         [KeyboardButton(text="🧹 Сброс контекста")],
+        [KeyboardButton(text="🎛 Тип работы бота")],
+        [KeyboardButton(text="🌐 Язык бота")],
         [KeyboardButton(text="◀️ Назад в меню")],
     ],
     resize_keyboard=True,
 )
 
-# ---------- Рейтконтроль ----------
+MODE_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="👨‍🏫 Нормальный учитель"), KeyboardButton(text="🧸 Объяснять по-простому")],
+        [KeyboardButton(text="🎯 Коучинг вопросами"), KeyboardButton(text="📝 Экзаменатор")],
+        [KeyboardButton(text="📐 Решение задач с объяснением"), KeyboardButton(text="💡 Только подсказки")],
+        [KeyboardButton(text="✅ Проверка моего решения"), KeyboardButton(text="📓 Конспект по теме")],
+        [KeyboardButton(text="🧪 Генератор тестов"), KeyboardButton(text="🎴 Карточки по теме")],
+        [KeyboardButton(text="📌 Шпаргалка"), KeyboardButton(text="🧠 Mind-map по теме")],
+        [KeyboardButton(text="📅 Учебный план по теме")],
+        [KeyboardButton(text="◀️ Назад в настройки")],
+    ],
+    resize_keyboard=True,
+)
+
 _last_send_ts: Dict[int, float] = {}
 _next_allowed_by_chat: Dict[int, float] = {}
-
-# антиспам-лок для PDF
 _export_lock: Dict[int, float] = {}
-
-# состояние мини-теста в памяти
 QUIZ_STATE: Dict[int, Dict] = {}
 
-# ------------- helpers -------------
 async def _is_pro(chat_id: int) -> bool:
     _, _, pro = await _plan_flags(chat_id)
     return pro
@@ -163,18 +460,14 @@ def _share_button(link: str, caption: str) -> InlineKeyboardButton:
 
 async def _send_referral_card(message: Message):
     stats = await get_referral_stats(message.chat.id)
-    code  = stats.get("ref_code") or await get_or_create_ref_code(message.chat.id)
-    link  = _ref_link_from_code(code)
-    paid  = int(stats.get("referred_paid_count") or 0)
+    code = stats.get("ref_code") or await get_or_create_ref_code(message.chat.id)
+    link = _ref_link_from_code(code)
+    paid = int(stats.get("referred_paid_count") or 0)
     total = int(stats.get("referred_count") or 0)
-
-    # Берём порог локально — если вдруг глобали нет, возьмём из ENV (дефолт 6)
     threshold = globals().get("REF_BONUS_THRESHOLD", int(os.getenv("REF_BONUS_THRESHOLD", "6")))
-
     progress = paid % threshold
-    left     = max(0, threshold - progress)
-    meter    = "█"*progress + "—"*(threshold-progress)
-
+    left = max(0, threshold - progress)
+    meter = "█" * progress + "—" * (threshold - progress)
     text = (
         "🎁 <b>Бонус за друзей</b>\n\n"
         f"Приглашай друзей по персональной ссылке.\n"
@@ -187,16 +480,12 @@ async def _send_referral_card(message: Message):
         f"— До следующего подарка: <b>{left}</b>\n\n"
         "Поделись ссылкой с одногруппниками, в чатах курса или друзьям 👇"
     )
-
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔗 Открыть ссылку", url=link),
         _share_button(link, "Помощник для учёбы — моя реф. ссылка:")
     ]])
-
     await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-
-# ---------- Безопасные отправки/редактирования ----------
 async def _respect_rate_limit(chat_id: int):
     now = time.monotonic()
     last = _last_send_ts.get(chat_id, 0.0)
@@ -276,11 +565,10 @@ async def send_long_text(message: Message, text: str):
         return
     for i in range(0, len(text), MAX_TG_LEN):
         await message.answer(
-            text[i:i+MAX_TG_LEN],
+            text[i:i + MAX_TG_LEN],
             reply_markup=main_kb_for_plan(await _is_free(message.chat.id)) if i + MAX_TG_LEN >= len(text) else None
         )
 
-# ---------- Экран «Мои подписки» ----------
 async def show_subscriptions(message: Message):
     text = await get_status_text(message.chat.id)
     low = text.lower()
@@ -292,12 +580,13 @@ async def show_subscriptions(message: Message):
     else:
         await message.answer(text)
 
-# ---------- Команды/кнопки ----------
+# ----------------- START / ЯЗЫК -----------------
+
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await ensure_user(message.chat.id)
 
-    # deep-link: /start ref_xxxxxx
+    # обработка реферального кода
     payload = None
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) > 1:
@@ -308,7 +597,18 @@ async def cmd_start(message: Message):
         if ref_id:
             await set_referrer_once(message.chat.id, ref_id)
 
-    # авто-включение озвучки для PRO
+    # обязательно сначала выбрать язык
+    prefs = await get_prefs(message.chat.id)
+    lang = (prefs or {}).get("lang")
+    if not isinstance(lang, str) or lang not in LANGUAGES:
+        await message.answer(
+            "🌐 Выберите язык бота (интерфейс + ответы).\n"
+            "Choose the bot language (interface + answers).",
+            reply_markup=LANG_SELECT_KB,
+        )
+        return
+
+    # авто-озвучка для PRO по умолчанию (если включено в конфиге)
     if TTS_ENABLED_DEFAULT_PRO and await _is_pro(message.chat.id):
         vs = await get_voice_settings(message.chat.id)
         if not vs.get("auto"):
@@ -316,22 +616,42 @@ async def cmd_start(message: Message):
 
     is_free = await _is_free(message.chat.id)
     kb = main_kb_for_plan(is_free)
-
-    greeting = (
-        "👋 Привет! Я — учебный помощник для школы и вузов.\n\n"
-        "Что я умею:\n"
-        "• Разбирать задачи по шагам (математика, физика и др.)\n"
-        "• Пояснять теорию простым языком\n"
-        "• Писать сочинения, эссе, конспекты, рефераты\n"
-        "• Помогать с кодом и оформлением решений\n"
-        "• Понимать фото/скриншоты задач 📷\n\n"
-        "Как начать:\n"
-        "— Пришли фото задачи или напиши текстом, что нужно.\n"
-        "— Нужна справка — жми «FAQ / Помощь».\n"
-        f"— { 'Обновить план — кнопка ниже.' if is_free else 'Статус доступа — «🧾 Мои подписки».' }\n"
-        "— 🎁 Бонус за друзей: пригласи друзей и получай PRO."
-    )
+    mode_key = await get_current_mode(message.chat.id)
+    mode_cfg = BOT_MODES.get(mode_key) or BOT_MODES["default"]
+    greeting = build_greeting(lang, is_free, mode_cfg["title"])
     await message.answer(greeting, reply_markup=kb)
+
+@router.message(Command("language"))
+async def cmd_language(message: Message):
+    await message.answer(
+        "🌐 Выберите язык бота (интерфейс + ответы).\n"
+        "Choose the bot language (interface + answers).",
+        reply_markup=LANG_SELECT_KB,
+    )
+
+@router.message(F.text == "🌐 Язык бота")
+async def settings_language(message: Message):
+    await cmd_language(message)
+
+@router.message(F.text.in_(list(LANG_BUTTONS.keys())))
+async def language_chosen(message: Message):
+    text = (message.text or "").strip()
+    code = LANG_BUTTONS.get(text)
+    if not code:
+        return
+    await set_pref(message.chat.id, "lang", code)
+    title = LANGUAGES.get(code, code)
+    is_free = await _is_free(message.chat.id)
+    kb = main_kb_for_plan(is_free)
+    mode_key = await get_current_mode(message.chat.id)
+    mode_cfg = BOT_MODES.get(mode_key) or BOT_MODES["default"]
+    greeting = build_greeting(code, is_free, mode_cfg["title"])
+    await message.answer(
+        f"✅ Язык сохранён: {title}.\n\n{greeting}",
+        reply_markup=kb,
+    )
+
+# ----------------- МЕНЮ, НАСТРОЙКИ, FAQ -----------------
 
 @router.message(F.text == "🎁 Бонус за друзей")
 async def kb_referral(message: Message):
@@ -362,15 +682,39 @@ async def cmd_reset(message: Message):
     await clear_history(message.chat.id)
     await message.answer("🧹 Контекст очищен", reply_markup=main_kb_for_plan(await _is_free(message.chat.id)))
 
-# ===== Раздел «Настройки» =====
 @router.message(F.text == "⚙️ Настройки")
 async def open_settings(message: Message):
     _, is_lite, is_pro = await _plan_flags(message.chat.id)
     extra = "" if is_pro else "\n\nℹ️ Учитель, авто-озвучка, PDF и мини-тест — в PRO."
     await message.answer(
-        "Настройки профиля:\n— авто-озвучка\n— режим Учителя\n— сброс контекста" + extra,
+        "Настройки профиля:\n— авто-озвучка\n— режим Учителя\n— сброс контекста\n— тип работы бота" + extra,
         reply_markup=SETTINGS_KB
     )
+
+@router.message(F.text == "🎛 Тип работы бота")
+async def open_modes_menu(message: Message):
+    mode_key = await get_current_mode(message.chat.id)
+    cfg = BOT_MODES.get(mode_key) or BOT_MODES["default"]
+    text = (
+        "Выберите, как бот будет вести себя по умолчанию.\n\n"
+        f"Текущий режим: {cfg['title']}\n"
+        f"{cfg['description']}"
+    )
+    await message.answer(text, reply_markup=MODE_KB)
+
+@router.message(F.text.in_(tuple(MODE_BUTTON_TEXT_TO_KEY.keys())))
+async def set_mode_from_button(message: Message):
+    key = MODE_BUTTON_TEXT_TO_KEY.get((message.text or "").strip())
+    if not key:
+        return
+    await set_current_mode(message.chat.id, key)
+    cfg = BOT_MODES.get(key) or BOT_MODES["default"]
+    text = f"Режим обновлён: {cfg['title']}\n\n{cfg['description']}"
+    await message.answer(text, reply_markup=MODE_KB)
+
+@router.message(F.text == "◀️ Назад в настройки")
+async def back_to_settings_from_modes(message: Message):
+    await open_settings(message)
 
 @router.message(F.text == "◀️ Назад в меню")
 async def back_from_settings(message: Message):
@@ -404,7 +748,6 @@ async def settings_voice_off(message: Message):
     await set_voice_settings(message.chat.id, auto=False)
     await message.answer("🔕 Авто-озвучка: ВЫКЛ.")
 
-# Команды для голоса (вне меню)
 @router.message(Command("voice_on"))
 async def cmd_voice_on(message: Message):
     if not await _is_pro(message.chat.id):
@@ -437,7 +780,6 @@ async def cmd_voice_speed(message: Message):
     await set_voice_settings(message.chat.id, speed=v)
     await message.answer(f"🎛 Скорость озвучки: {max(0.5, min(1.6, v)):.2f}")
 
-# Закладки
 @router.message(Command("remember"))
 async def cmd_remember(message: Message):
     last = await _last_assistant_text(message.chat.id)
@@ -458,7 +800,6 @@ async def cmd_forget(message: Message):
     ok = await forget_last_bookmark(message.chat.id)
     await message.answer("🗑 Удалил последнюю закладку." if ok else "Закладок не найдено.")
 
-# Режим объяснения «Учитель» (разово)
 @router.message(Command("explain"))
 async def cmd_explain(message: Message, state: FSMContext):
     if not await _is_pro(message.chat.id):
@@ -466,7 +807,6 @@ async def cmd_explain(message: Message, state: FSMContext):
     await message.answer("Отправь вопрос/задачу — объясню как учитель: простые шаги, типичные ошибки и мини-проверка.")
     await set_teacher_mode(message.chat.id, True)
 
-# ---------- FAQ / Помощь ----------
 FAQ_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Как пользоваться ботом")],
@@ -493,7 +833,7 @@ async def faq_how(message: Message):
         "«<i>PDF</i>», «<i>Проверить себя</i>», «<i>Озвучить</i>».\n"
         "4️⃣ <b>Голосовые ответы</b>: включите <code>/voice_on</code>, выключите <code>/voice_off</code>.\n\n"
         "🧭 <b>Где что искать</b>\n"
-        "• <b>⚙️ Настройки</b> — авто-озвучка, режим Учителя, сброс контекста.\n"
+        "• <b>⚙️ Настройки</b> — авто-озвучка, режим Учителя, сброс контекста, тип работы бота.\n"
         "• <b>🧾 Статус/тариф</b> — «Мои подписки» (или «Обновить план» в FREE).\n\n"
         "💡 <i>Совет:</i> если не хватает данных (чисел/условий), бот подскажет, что уточнить."
     )
@@ -562,7 +902,8 @@ async def faq_offer(message: Message):
 async def faq_back(message: Message):
     await message.answer("Возврат в главное меню", reply_markup=main_kb_for_plan(await _is_free(message.chat.id)))
 
-# ---------- Admin panel / рассылки ----------
+# ----------------- АДМИНКА, РАССЫЛКИ -----------------
+
 import json
 from pathlib import Path
 
@@ -605,10 +946,11 @@ async def secret_code_grant(message: Message):
     uid = message.from_user.id
     if is_admin(uid):
         return await message.answer("Вы уже в админ-режиме.", reply_markup=ADMIN_KB)
-
     if len(ADMINS) >= MAX_ADMINS:
-        return await message.answer("Нельзя добавить нового админа — достигнут лимит (2 админа).", reply_markup=main_kb_for_plan(await _is_free(message.chat.id)))
-
+        return await message.answer(
+            "Нельзя добавить нового админа — достигнут лимит (2 админа).",
+            reply_markup=main_kb_for_plan(await _is_free(message.chat.id)),
+        )
     ADMINS.add(uid)
     _save_admins()
     await message.answer("✅ Вы добавлены как админ. Открываю админ-панель.", reply_markup=ADMIN_KB)
@@ -646,19 +988,18 @@ class AdminBroadcastStates(StatesGroup):
     confirm = State()
 
 BROADCAST_CONCURRENCY = 20
-BROADCAST_DELAY_SEC   = 0.03
+BROADCAST_DELAY_SEC = 0.03
 
 def _progress_bar(pct: float, width: int = 12) -> str:
     done = int(round(pct * width))
-    return f"[{'█'*done}{'—'*(width-done)}] {int(pct*100)}%"
+    return f"[{'█' * done}{'—' * (width - done)}] {int(pct * 100)}%"
 
 def _confirm_kb(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"bcast_confirm_{kind}"),
-        InlineKeyboardButton(text="❌ Отменить",    callback_data="bcast_cancel"),
+        InlineKeyboardButton(text="❌ Отменить", callback_data="bcast_cancel"),
     ]])
 
-# ---- Админ кнопки
 @router.message(F.text == "📊 Кол-во подписчиков")
 async def admin_count(message: Message):
     if not is_admin(message.from_user.id):
@@ -730,7 +1071,6 @@ async def _deliver_to_all(bot, send_corofn, progress_msg: Message):
                 except Exception:
                     pass
             except TelegramBadRequest as e:
-                # удалённый чат/блок — можно почистить
                 txt = str(e).lower()
                 if "bot was blocked" in txt or "chat not found" in txt:
                     try:
@@ -739,7 +1079,6 @@ async def _deliver_to_all(bot, send_corofn, progress_msg: Message):
                         pass
             except Exception:
                 pass
-            # прогресс
             try:
                 pct = ok / max(1, total)
                 await bot.edit_message_text(
@@ -768,25 +1107,25 @@ async def admin_broadcast_confirm(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     kind = "text" if call.data.endswith("text") else "photo"
     await state.clear()
-
     progress = await call.message.answer("Рассылка…")
     bot = call.message.bot
-
     if kind == "text":
         text = data["text"]
+
         async def sender(chat_id: int):
             await bot.send_message(chat_id, text)
+
         await _deliver_to_all(bot, sender, progress)
     else:
         file_id = data["file_id"]
         caption = data.get("caption")
+
         async def sender(chat_id: int):
             await bot.send_photo(chat_id, file_id, caption=caption)
-        await _deliver_to_all(bot, sender, progress)
 
+        await _deliver_to_all(bot, sender, progress)
     await call.answer()
 
-# ---------- Callback-кнопки под статусом ----------
 @router.callback_query(F.data == "show_plans")
 async def cb_show_plans(call: CallbackQuery):
     await call.message.edit_text("Доступные пакеты:", reply_markup=plans_kb(show_back=True))
@@ -803,7 +1142,8 @@ async def cb_back_to_subs(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
 
-# ---------- Генерация текста ----------
+# ----------------- ОСНОВНОЙ ФЛОУ: ТЕКСТ -----------------
+
 @router.message(StateFilter('generating'))
 async def wait_response(message: Message):
     await safe_send(message, "⏳ Ответ генерируется... дождитесь окончания предыдущего запроса!")
@@ -823,6 +1163,32 @@ async def generate_answer(message: Message, state: FSMContext):
     if not user_text:
         return
 
+    # нажали кнопку выбора языка — здесь ничего не делаем
+    if user_text in LANG_BUTTONS:
+        return
+
+    # промокод тестового доступа (школьники-тестировщики)
+    if PROMO_CODE and user_text.lower() == PROMO_CODE.lower():
+        await ensure_user(chat_id)
+        activated, exp = await apply_promocode_access(chat_id, PROMO_CODE, days=PROMO_PRO_DAYS)
+        prefs = await get_prefs(chat_id)
+        lang_pref = (prefs or {}).get("lang")
+        exp_s = exp.strftime("%Y-%m-%d %H:%M UTC") if exp else ""
+        if activated:
+            msg = f"✅ Промокод активирован! Доступ PRO открыт до {exp_s}."
+        else:
+            msg = f"ℹ️ Промокод уже активирован. Доступ PRO действует до {exp_s}."
+        if not isinstance(lang_pref, str) or lang_pref not in LANGUAGES:
+            await message.answer(msg + "\n\n🌐 Теперь выберите язык бота:", reply_markup=LANG_SELECT_KB)
+        else:
+            await message.answer(msg, reply_markup=main_kb_for_plan(False))
+        return
+
+    user_db_id = await ensure_user(chat_id)
+    lang = await ensure_language_selected(message)
+    if lang is None:
+        return
+
     now = time.monotonic()
     next_allowed = _next_allowed_by_chat.get(chat_id, 0.0)
     if now < next_allowed:
@@ -831,12 +1197,10 @@ async def generate_answer(message: Message, state: FSMContext):
         return
     _next_allowed_by_chat[chat_id] = now + COOLDOWN_SECONDS
 
-    await ensure_user(chat_id)
-    allowed, msg = await can_use(await ensure_user(chat_id), "text")
+    allowed, msg = await can_use(user_db_id, "text")
     if not allowed:
         await message.answer(msg, reply_markup=plans_kb(show_back=True))
         return
-
     is_pro = await _is_pro(chat_id)
     if is_pro and await is_teacher_mode(chat_id):
         user_text = (
@@ -844,12 +1208,12 @@ async def generate_answer(message: Message, state: FSMContext):
             "где часто ошибаются, мини-проверка на 2–3 вопроса в конце.\n\nВопрос: "
             + user_text
         )
-
+    user_text = await apply_mode_to_text(chat_id, user_text)
     await state.set_state("generating")
     await message.bot.send_chat_action(chat_id, ChatAction.TYPING)
     draft = await safe_send(message, "Думаю…")
-
     typing_alive = True
+
     async def typing_loop():
         while typing_alive:
             try:
@@ -857,11 +1221,10 @@ async def generate_answer(message: Message, state: FSMContext):
             except Exception:
                 pass
             await asyncio.sleep(4)
-    typing_task = asyncio.create_task(typing_loop())
 
+    typing_task = asyncio.create_task(typing_loop())
     accumulated = ""
     last_edit = 0.0
-
     try:
         history_msgs = await get_history(chat_id)
         async for delta in stream_response_text(user_text, history_msgs, priority=is_pro, teacher_mode=False):
@@ -870,9 +1233,7 @@ async def generate_answer(message: Message, state: FSMContext):
             if t - last_edit >= MIN_EDIT_INTERVAL:
                 await safe_edit(message, draft.message_id, accumulated or "…")
                 last_edit = t
-
         final_text = (f"⚡ PRO-приоритет\n{accumulated}" if is_pro else accumulated) if accumulated else ""
-
         if final_text:
             if len(final_text) > MAX_TG_LEN:
                 await safe_delete(draft)
@@ -882,16 +1243,13 @@ async def generate_answer(message: Message, state: FSMContext):
                 await safe_edit(message, draft.message_id, final_text, reply_markup=answer_actions_kb(is_pro))
         else:
             await safe_edit(message, draft.message_id, "Пустой ответ 😕")
-
         await add_history(chat_id, "user", user_text)
         await add_history(chat_id, "assistant", accumulated or "")
         await inc_usage(chat_id, "text")
-
         if is_pro:
             vs = await get_voice_settings(chat_id)
             if vs.get("auto") and accumulated:
                 await _send_tts_for_text(message, accumulated)
-
     except Exception as e:
         await safe_edit(message, draft.message_id, f"❌ Ошибка: {e}")
     finally:
@@ -899,10 +1257,15 @@ async def generate_answer(message: Message, state: FSMContext):
         typing_task.cancel()
         await state.clear()
 
-# ---------- Фото-задачи ----------
+# ----------------- ФОТО -----------------
+
 @router.message(F.photo)
 async def on_photo(message: Message, state: FSMContext):
     chat_id = message.chat.id
+    user_db_id = await ensure_user(chat_id)
+    lang = await ensure_language_selected(message)
+    if lang is None:
+        return
 
     now = time.monotonic()
     next_allowed = _next_allowed_by_chat.get(chat_id, 0.0)
@@ -912,38 +1275,31 @@ async def on_photo(message: Message, state: FSMContext):
         return
     _next_allowed_by_chat[chat_id] = now + COOLDOWN_SECONDS
 
-    await ensure_user(chat_id)
-    allowed, msg = await can_use(await ensure_user(chat_id), "photo")
+    allowed, msg = await can_use(user_db_id, "photo")
     if not allowed:
         await message.answer(msg, reply_markup=plans_kb(show_back=True))
         return
-
     await state.set_state("generating")
     await message.bot.send_chat_action(chat_id, ChatAction.TYPING)
     draft = await safe_send(message, "Распознаю задачу с фото…")
-
     try:
         largest = message.photo[-1]
         file = await message.bot.get_file(largest.file_id)
         buf = BytesIO()
         await message.bot.download_file(file.file_path, buf)
         image_bytes = buf.getvalue()
-
         teacher_hint = ""
         if await _is_pro(chat_id) and await is_teacher_mode(chat_id):
-            teacher_hint = (
-                "Объясняй как учитель: короткое введение, пошагово, типичные ошибки, в конце мини-проверка (2–3 вопроса). "
-            )
-
+            teacher_hint = "Объясняй как учитель: короткое введение, пошагово, типичные ошибки, в конце мини-проверка (2–3 вопроса). "
+        base_hint = teacher_hint + "Распознай условие и реши задачу. Покажи формулы, вычисления и итог."
+        hint_text = await apply_mode_to_text(chat_id, base_hint)
         answer = await solve_from_image(
             image_bytes,
-            hint= teacher_hint + "Распознай условие и реши задачу. Покажи формулы, вычисления и итог.",
+            hint=hint_text,
             history=await get_history(chat_id)
         )
-
         is_pro = await _is_pro(chat_id)
         final_text = f"⚡ PRO-приоритет\n{answer}" if (is_pro and answer) else (answer or "Не удалось распознать задачу.")
-
         if len(final_text) > MAX_TG_LEN:
             await safe_delete(draft)
             await send_long_text(message, final_text)
@@ -954,22 +1310,20 @@ async def on_photo(message: Message, state: FSMContext):
                 message, draft.message_id, final_text,
                 reply_markup=answer_actions_kb(is_pro and bool(answer))
             )
-
         await add_history(chat_id, "user", "[Фото задачи]")
         await add_history(chat_id, "assistant", answer or "")
         await inc_usage(chat_id, "photo")
-
         if is_pro:
             vs = await get_voice_settings(chat_id)
             if vs.get("auto") and answer:
                 await _send_tts_for_text(message, answer)
-
     except Exception as e:
         await safe_edit(message, draft.message_id, f"❌ Ошибка по фото: {e}")
     finally:
         await state.clear()
 
-# ---------- TTS & прочие callbacks ----------
+# ----------------- TTS / PDF / QUIZ -----------------
+
 @router.callback_query(F.data == "tts_say")
 async def cb_tts_say(call: CallbackQuery):
     chat_id = call.message.chat.id
@@ -989,30 +1343,23 @@ async def cb_tts_say(call: CallbackQuery):
         except Exception:
             pass
 
-# ======= PDF (анти-спам и возврат клавиатуры) =======
 @router.callback_query(F.data == "export_pdf")
 async def cb_export_pdf(call: CallbackQuery):
     chat_id = call.message.chat.id
     if not await _is_pro(chat_id):
         return await call.answer("Экспорт PDF доступен только в PRO.", show_alert=True)
-
-    # антидубликаты (6 сек)
     now = time.monotonic()
     if _export_lock.get(chat_id, 0.0) > now:
         return await call.answer("Уже экспортирую…", show_alert=False)
     _export_lock[chat_id] = now + 6.0
-
     answer = await _last_assistant_text(chat_id)
     if not answer:
         _export_lock.pop(chat_id, None)
         return await call.answer("Нет текста для экспорта", show_alert=True)
-
-    # временно убираем клавиатуру, чтобы не кликали повторно
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-
     try:
         pdf = pdf_from_answer_text(answer, title="Разбор задачи", author="Учебный помощник")
         bi = BufferedInputFile(pdf.getvalue(), filename="razbor.pdf")
@@ -1022,54 +1369,42 @@ async def cb_export_pdf(call: CallbackQuery):
         await call.answer(f"Ошибка экспорта: {e}", show_alert=True)
     finally:
         _export_lock.pop(chat_id, None)
-        # вернуть клавиатуру действий
         try:
             is_pro = await _is_pro(chat_id)
             await call.message.edit_reply_markup(reply_markup=answer_actions_kb(is_pro))
         except Exception:
             pass
 
-# ======= Мини-тест с кнопками A/B/C/D =======
 def _quiz_kb(qi: dict, q_index: int) -> InlineKeyboardMarkup:
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
     builder = InlineKeyboardBuilder()
-
     options = (qi.get("options") or [])[:4]
     for i, opt in enumerate(options):
-        # каждая кнопка в СВОЕЙ строке
         builder.row(
             InlineKeyboardButton(
-                text=f"{chr(65+i)}) {opt}",
+                text=f"{chr(65 + i)}) {opt}",
                 callback_data=f"quiz_answer:{q_index}:{i}"
             )
         )
-
-    # на всякий случай зафиксируем ширину строки = 1
     builder.adjust(1)
     return builder.as_markup()
-
 
 @router.callback_query(F.data == "quiz_make")
 async def cb_quiz_make(call: CallbackQuery):
     chat_id = call.message.chat.id
     if not await _is_pro(chat_id):
         return await call.answer("Мини-тест доступен только в PRO.", show_alert=True)
-
     answer = await _last_assistant_text(chat_id)
     if not answer or len(answer) < 40:
         return await call.answer("Сначала получи разбор/ответ, потом сделаю тест.", show_alert=True)
-
     await call.answer("Готовлю мини-тест…", show_alert=False)
     try:
         md, data = await quiz_from_answer(answer, n_questions=4)
         items = (data or {}).get("questions") or []
         if not items:
-            # fallback: отправим хотя бы md-версию
             return await call.message.answer(f"🧠 Мини-тест\n\n{md}")
-
         QUIZ_STATE[chat_id] = {"idx": 0, "items": items}
         q0 = items[0]
-        text = f"🧠 Мини-тест\n\nВопрос 1/{len(items)}:\n{q0.get('q','')}"
+        text = f"🧠 Мини-тест\n\nВопрос 1/{len(items)}:\n{q0.get('q', '')}"
         await call.message.answer(text, reply_markup=_quiz_kb(q0, 0))
     except Exception as e:
         await call.message.answer(f"❌ Не удалось построить тест: {e}")
@@ -1079,46 +1414,41 @@ async def cb_quiz_answer(call: CallbackQuery):
     chat_id = call.message.chat.id
     try:
         _, q_index_str, opt_idx_str = call.data.split(":")
-        q_idx = int(q_index_str); opt_idx = int(opt_idx_str)
+        q_idx = int(q_index_str)
+        opt_idx = int(opt_idx_str)
         state = QUIZ_STATE.get(chat_id)
         if not state:
             return await call.answer("Тест не найден.", show_alert=True)
-
         items = state["items"]
         if q_idx >= len(items):
             return await call.answer("Вопрос не найден.", show_alert=True)
-
         qi = items[q_idx]
         correct_letter = (qi.get("correct") or "A").strip().upper()
         correct_idx = "ABCD".find(correct_letter)
         if correct_idx < 0:
             correct_idx = 0
-
         ok = (opt_idx == correct_idx)
         await call.answer("Верно! ✅" if ok else f"Неверно. ❌ Правильный ответ: {correct_letter}", show_alert=False)
-
-        # следующий вопрос или итог
         next_idx = q_idx + 1
         if next_idx < len(items):
             state["idx"] = next_idx
             qn = items[next_idx]
-            await call.message.answer(f"Вопрос {next_idx+1}/{len(items)}:\n{qn.get('q','')}",
-                                      reply_markup=_quiz_kb(qn, next_idx))
+            await call.message.answer(
+                f"Вопрос {next_idx + 1}/{len(items)}:\n{qn.get('q', '')}",
+                reply_markup=_quiz_kb(qn, next_idx)
+            )
         else:
             QUIZ_STATE.pop(chat_id, None)
             await call.message.answer("Готово! Хочешь ещё раз — жми «🧠 Проверить себя».")
     except Exception:
         await call.answer("Ошибка обработки ответа.", show_alert=True)
 
-# ---------- Апселл-замочки ----------
-@router.callback_query(F.data.in_(("need_pro_pdf","need_pro_quiz")))
+@router.callback_query(F.data.in_(("need_pro_pdf", "need_pro_quiz")))
 async def cb_need_pro(call: CallbackQuery):
     await call.answer("Функция доступна только в PRO.", show_alert=True)
     await call.message.answer("Оформите PRO, чтобы открыть PDF и мини-тест:", reply_markup=plans_kb(show_back=False))
 
-# ---------- Вспомогательное: отправить TTS по тексту ----------
 async def _send_tts_for_text(message: Message, text: str):
-    """Режем на части и шлём voice .ogg (Opus) с учётом профиля голоса (имя + скорость)."""
     chunks = split_for_tts(text, max_chars=TTS_CHUNK_LIMIT)
     try:
         vs = await get_voice_settings(message.chat.id)
@@ -1126,7 +1456,6 @@ async def _send_tts_for_text(message: Message, text: str):
         vs = {"name": None, "speed": None}
     voice_name = (vs or {}).get("name")
     voice_speed = (vs or {}).get("speed")
-
     for idx, chunk in enumerate(chunks, 1):
         try:
             voice_bio = await tts_voice_ogg(chunk, voice=voice_name, speed=voice_speed)
