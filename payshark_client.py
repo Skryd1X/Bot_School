@@ -30,12 +30,18 @@ from decimal import Decimal, InvalidOperation
 
 
 def _normalize_currency(cur: str) -> str:
-    cur = (cur or "").upper().strip()
-    # Extract ISO-like 3-letter code from anything like "RUB ₽"
-    m = re.search(r"[A-Z]{3}", cur)
-    code = m.group(0) if m else ""
-    allowed = {"RUB", "RUR", "USD", "EUR", "KZT", "UZS"}
-    return code if code in allowed else "RUB"
+    """Normalize currency code for Payshark.
+
+    IMPORTANT: Do not hardcode an allowlist here — allowed currencies depend on the merchant setup
+    inside Payshark (fiat vs crypto, enabled currencies, etc.).
+    We simply extract a plausible currency token and pass it through.
+    """
+    cur = (cur or "").strip().upper()
+    # Accept common codes like RUB, RUR, USD, EUR, USDT, TRX, etc.
+    # If the env contains extra symbols (e.g. "RUB ₽"), we still extract the code.
+    m = re.search(r"[A-Z0-9]{3,8}", cur)
+    return m.group(0) if m else "RUB"
+
 
 
 def _normalize_amount_int(val: Any) -> int:
@@ -211,7 +217,7 @@ class PaysharkClient:
             payload = {"raw_text": r.text}
 
         if r.status_code >= 400:
-            raise RuntimeError(f"Payshark H2H HTTP {r.status_code}: {r.text[:1200]}")
+            raise RuntimeError(f"Payshark H2H HTTP {r.status_code}: amount={amount_i} currency={currency_code} body={r.text[:1200]}")
 
         obj = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
         if not isinstance(obj, dict):
