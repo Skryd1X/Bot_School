@@ -365,16 +365,6 @@ def _as_float_price(value: str) -> float:
         return 0.0
 
 
-def _normalize_currency(cur: str) -> str:
-    import re
-
-    cur = (cur or "").upper().strip()
-    m = re.search(r"[A-Z]{3}", cur)
-    code = m.group(0) if m else ""
-    allowed = {"RUB", "RUR", "USD", "EUR", "KZT", "UZS"}
-    return code if code in allowed else "RUB"
-
-
 def _format_payment_detail(detail: Any) -> str:
     """Pretty-format payment_detail from H2H response (string/dict/list/etc)."""
     if detail is None:
@@ -1332,9 +1322,7 @@ async def cb_pay_plan(call: CallbackQuery):
     plan = "lite" if call.data == "pay_lite" else "pro"
     price_str = LITE_PRICE if plan == "lite" else PRO_PRICE
     amount_f = _as_float_price(price_str)
-    amount_i = int(round(amount_f))
-    currency_norm = _normalize_currency(PAYSHARK_CURRENCY)
-
+    amount = int(round(float(amount_f)))
     if not PUBLIC_BASE_URL:
         await call.message.answer(
             "⚠️ Оплата временно недоступна (не настроен PUBLIC_BASE_URL).\n"
@@ -1350,14 +1338,17 @@ async def cb_pay_plan(call: CallbackQuery):
     try:
         client = PaysharkClient()
         order = await client.create_h2h_order(
-            amount=amount_i,
-            currency=currency_norm,
+            amount=int(amount),
             external_id=external_id,
-            callback_url=callback_url,
             client_id=str(chat_id),
+            # По доке Payshark (пример): payment_gateway=sberbank, payment_detail_type=card
+            payment_gateway=(os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "sberbank"),
+            payment_detail_type=(os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card"),
+            white_triangle=((os.getenv("PAYSHARK_WHITE_TRIANGLE") or "true").strip().lower() in {"1","true","yes","y"}),
+            # currency в примере доки нет — не шлём, чтобы не ловить 422 по разрешённым валютам
+            currency=None,
             description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
-        )
-    except Exception as e:
+        )except Exception as e:
         import logging, re
         log = logging.getLogger('payments')
         code = 'H2H_ERR'
@@ -1388,8 +1379,8 @@ async def cb_pay_plan(call: CallbackQuery):
             pay_id=str(order.order_id),
             chat_id=int(chat_id),
             plan=str(plan),
-            amount=float(amount_i),
-            currency=str(order.currency or currency_norm or "RUB"),
+            amount=float(amount),
+            currency=str(order.currency or PAYSHARK_CURRENCY or "RUB"),
             provider="payshark",
             raw_create=order.raw,
         )
