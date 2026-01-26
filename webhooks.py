@@ -5,6 +5,15 @@ import json
 import datetime as dt
 from typing import Any, Dict, Optional, Tuple
 
+import asyncio
+from startbot import bot, dp  # важно: startbot.py не должен стартовать polling при импорте
+
+@app.on_event("startup")
+async def on_startup():
+    app.state.bot = bot
+    asyncio.create_task(dp.start_polling(bot))
+
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -392,38 +401,3 @@ async def payshark_webhook(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
-# -----------------------------
-# Legacy Tribute (optional)
-# -----------------------------
-if USE_TRIBUTE:
-
-    @app.post("/tribute/webhook")
-    async def tribute_webhook(request: Request) -> JSONResponse:
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
-
-        if not isinstance(payload, dict):
-            payload = {"_": payload}
-
-        event = str(payload.get("event") or payload.get("type") or "").lower()
-        status = str(payload.get("status") or "").lower()
-
-        is_paid = ("paid" in event) or ("success" in event) or (status in {"paid", "success", "succeeded"})
-        if not is_paid:
-            return JSONResponse({"ok": True, "paid": False})
-
-        user_id = payload.get("user_id") or payload.get("chat_id")
-        plan = payload.get("plan") or payload.get("tariff")
-        try:
-            user_id = int(user_id)
-        except Exception:
-            raise HTTPException(status_code=400, detail="user_id is missing")
-
-        plan = str(plan or "lite").lower()
-        if plan not in {"lite", "pro"}:
-            plan = "lite"
-
-        await set_subscription(user_id, plan=plan)  # days default in db
-        return JSONResponse({"ok": True, "paid": True})
