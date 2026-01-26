@@ -17,16 +17,14 @@ from db import (
     set_subscription,
 )
 
-# -----------------------------
-# Settings (PayShark only)
-# -----------------------------
-NOTIFY_ON_PAYMENT = os.getenv("NOTIFY_ON_PAYMENT", "true").lower() == "true"
-PAYSHARK_WEBHOOK_SECRET = os.getenv("PAYSHARK_WEBHOOK_SECRET", "").strip()
-
-LITE_PRICE = float(os.getenv("LITE_PRICE", "200"))
-PRO_PRICE = float(os.getenv("PRO_PRICE", "300"))
-
 app = FastAPI()
+
+NOTIFY_ON_PAYMENT = (os.getenv("NOTIFY_ON_PAYMENT") or "true").lower() == "true"
+
+PAYSHARK_WEBHOOK_SECRET = (os.getenv("PAYSHARK_WEBHOOK_SECRET") or "").strip()
+
+LITE_PRICE = float(os.getenv("PAYSHARK_LITE_PRICE") or os.getenv("LITE_PRICE") or "200")
+PRO_PRICE = float(os.getenv("PAYSHARK_PRO_PRICE") or os.getenv("PRO_PRICE") or "300")
 
 
 def _now_utc() -> dt.datetime:
@@ -76,9 +74,7 @@ def _first(*vals: Any) -> Any:
 
 def _parse_int(v: Any) -> Optional[int]:
     try:
-        if v is None:
-            return None
-        if isinstance(v, bool):
+        if v is None or isinstance(v, bool):
             return None
         return int(str(v).strip())
     except Exception:
@@ -94,9 +90,6 @@ def _parse_float(v: Any) -> Optional[float]:
         return None
 
 
-# -----------------------------
-# DB helpers
-# -----------------------------
 async def get_payment(order_id: str) -> Optional[Dict[str, Any]]:
     p = await payment_get(order_id)
     if p:
@@ -148,13 +141,9 @@ async def grant_paid_access(
     )
 
     await set_subscription(int(chat_id), plan=str(plan))
-
     await payment_mark_processed(pay_key)
 
 
-# -----------------------------
-# Extraction
-# -----------------------------
 def _extract_chat_and_plan(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
     meta = _first(
         payload.get("meta"),
@@ -211,16 +200,13 @@ def _extract_chat_and_plan(payload: Dict[str, Any]) -> Tuple[Optional[int], Opti
     )
     if isinstance(desc, str):
         d = desc.lower()
-        import re
-
-        m = re.search(r"(chat[_-]?id)\s*[:=]\s*(\d{4,15})", d)
-        if not chat_id and m:
-            chat_id = _parse_int(m.group(2))
-
         if "plan=pro" in d or "tariff=pro" in d or " pro " in d:
-            return chat_id, "pro"
-        if "plan=lite" in d or "tariff=lite" in d or " lite " in d:
-            return chat_id, "lite"
+            plan = "pro"
+        elif "plan=lite" in d or "tariff=lite" in d or " lite " in d:
+            plan = "lite"
+
+    if isinstance(plan, str) and plan in {"lite", "pro"}:
+        return chat_id, plan
 
     return chat_id, None
 
@@ -233,7 +219,6 @@ def _extract_payment_ids(payload: Dict[str, Any]) -> Tuple[Optional[str], Option
         _get(payload, "data.payment_id"),
         _get(payload, "data.payment.id"),
         _get(payload, "payment.id"),
-        _get(payload, "payment.payment_id"),
         _get(payload, "invoice.id"),
         _get(payload, "invoice_id"),
     )
@@ -248,10 +233,7 @@ def _extract_payment_ids(payload: Dict[str, Any]) -> Tuple[Optional[str], Option
         _get(payload, "payment.order_id"),
         _get(payload, "payment.external_id"),
     )
-    return (
-        str(payment_id) if payment_id is not None else None,
-        str(order_id) if order_id is not None else None,
-    )
+    return (str(payment_id) if payment_id is not None else None, str(order_id) if order_id is not None else None)
 
 
 def _extract_amount_currency(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[str]]:
@@ -316,9 +298,6 @@ def _verify_signature_if_possible(request: Request, body: bytes) -> None:
         raise HTTPException(status_code=401, detail="Invalid signature")
 
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     return {"ok": True, "ts": _now_utc().isoformat()}
@@ -382,8 +361,8 @@ async def payshark_webhook(request: Request) -> JSONResponse:
                     if plan == "lite"
                     else "✅ Оплата получена. Подписка PRO активирована на 30 дней."
                 )
-                await bot.send_message(chat_id, txt)
+                await bot.send_message(int(chat_id), txt)
             except Exception:
                 pass
 
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "paid": True})
