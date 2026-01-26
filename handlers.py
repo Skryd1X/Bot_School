@@ -1348,7 +1348,9 @@ async def cb_pay_plan(call: CallbackQuery):
             # currency в примере доки нет — не шлём, чтобы не ловить 422 по разрешённым валютам
             currency=None,
             description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
-        )except Exception as e:
+        )
+
+        except Exception as e:
         import logging, re
         log = logging.getLogger('payments')
         code = 'H2H_ERR'
