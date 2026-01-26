@@ -5,15 +5,6 @@ import json
 import datetime as dt
 from typing import Any, Dict, Optional, Tuple
 
-import asyncio
-
-
-@app.on_event("startup")
-async def on_startup():
-    app.state.bot = bot
-    asyncio.create_task(dp.start_polling(bot))
-
-
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -30,12 +21,10 @@ from db import (
 # Settings (PayShark only)
 # -----------------------------
 NOTIFY_ON_PAYMENT = os.getenv("NOTIFY_ON_PAYMENT", "true").lower() == "true"
-
 PAYSHARK_WEBHOOK_SECRET = os.getenv("PAYSHARK_WEBHOOK_SECRET", "").strip()
 
 LITE_PRICE = float(os.getenv("LITE_PRICE", "200"))
 PRO_PRICE = float(os.getenv("PRO_PRICE", "300"))
-
 
 app = FastAPI()
 
@@ -64,7 +53,6 @@ def _consteq(a: str, b: str) -> bool:
 
 
 def _get(obj: Any, path: str) -> Any:
-    """Get nested values by dot path: 'data.payment.id'."""
     cur = obj
     for part in path.split("."):
         if cur is None:
@@ -107,7 +95,7 @@ def _parse_float(v: Any) -> Optional[float]:
 
 
 # -----------------------------
-# DB compatibility helpers
+# DB helpers
 # -----------------------------
 async def get_payment(order_id: str) -> Optional[Dict[str, Any]]:
     p = await payment_get(order_id)
@@ -159,8 +147,7 @@ async def grant_paid_access(
         external_id=order_id or payment_id,
     )
 
-    # Активируем подписку (days берётся по дефолту из db.py)
-    await set_subscription(int(chat_id), plan=str(plan))  # type: ignore[arg-type]
+    await set_subscription(int(chat_id), plan=str(plan))
 
     await payment_mark_processed(pay_key)
 
@@ -169,7 +156,6 @@ async def grant_paid_access(
 # Extraction
 # -----------------------------
 def _extract_chat_and_plan(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
-    """Best-effort extraction of chat_id and plan from a webhook payload."""
     meta = _first(
         payload.get("meta"),
         payload.get("metadata"),
@@ -211,11 +197,10 @@ def _extract_chat_and_plan(payload: Dict[str, Any]) -> Tuple[Optional[int], Opti
         _get(payload, "data.tariff"),
     )
     if isinstance(plan, str):
-        plan = plan.strip().lower()
-        if plan in {"lite", "pro"}:
-            return chat_id, plan
+        p = plan.strip().lower()
+        if p in {"lite", "pro"}:
+            return chat_id, p
 
-    # fallback: try parse from description-like fields
     desc = _first(
         meta.get("description"),
         payload.get("description"),
@@ -231,13 +216,11 @@ def _extract_chat_and_plan(payload: Dict[str, Any]) -> Tuple[Optional[int], Opti
         m = re.search(r"(chat[_-]?id)\s*[:=]\s*(\d{4,15})", d)
         if not chat_id and m:
             chat_id = _parse_int(m.group(2))
-        if "plan=pro" in d or "tariff=pro" in d or " pro " in d:
-            plan = "pro"
-        if "plan=lite" in d or "tariff=lite" in d or " lite " in d:
-            plan = "lite"
 
-    if isinstance(plan, str) and plan in {"lite", "pro"}:
-        return chat_id, plan
+        if "plan=pro" in d or "tariff=pro" in d or " pro " in d:
+            return chat_id, "pro"
+        if "plan=lite" in d or "tariff=lite" in d or " lite " in d:
+            return chat_id, "lite"
 
     return chat_id, None
 
@@ -265,7 +248,10 @@ def _extract_payment_ids(payload: Dict[str, Any]) -> Tuple[Optional[str], Option
         _get(payload, "payment.order_id"),
         _get(payload, "payment.external_id"),
     )
-    return (str(payment_id) if payment_id is not None else None, str(order_id) if order_id is not None else None)
+    return (
+        str(payment_id) if payment_id is not None else None,
+        str(order_id) if order_id is not None else None,
+    )
 
 
 def _extract_amount_currency(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[str]]:
@@ -297,6 +283,7 @@ def _is_paid(payload: Dict[str, Any]) -> bool:
         _get(payload, "payment.status"),
         _get(payload, "invoice.status"),
     )
+
     s = ""
     if isinstance(event, str):
         s += " " + event.lower()
@@ -348,33 +335,31 @@ async def payshark_webhook(request: Request) -> JSONResponse:
     amount, currency = _extract_amount_currency(payload)
     chat_id, plan = _extract_chat_and_plan(payload)
 
-    # If plan is absent, try infer from amount
     if plan is None and amount is not None:
         if abs(amount - LITE_PRICE) < 0.0001:
             plan = "lite"
         elif abs(amount - PRO_PRICE) < 0.0001:
             plan = "pro"
 
-    if not chat_id:
-        # try lookup from our payments collection by order_id
-        if order_id:
-            p = await get_payment(order_id)
-            if p and p.get("chat_id"):
-                chat_id = int(p["chat_id"])
-                if not plan and p.get("plan"):
-                    plan = str(p["plan"]).lower()
+    if not chat_id and order_id:
+        p = await get_payment(order_id)
+        if p and p.get("chat_id"):
+            chat_id = int(p["chat_id"])
+            if not plan and p.get("plan"):
+                plan = str(p["plan"]).lower()
+
+    pay_key = order_id or payment_id or "unknown"
 
     if not chat_id:
-        await mark_payment_status(order_id or payment_id or "unknown", status="bad_payload", payment_id=payment_id, raw=payload)
+        await mark_payment_status(pay_key, status="bad_payload", payment_id=payment_id, raw=payload)
         raise HTTPException(status_code=400, detail="chat_id is missing in webhook payload")
 
     if plan not in {"lite", "pro"}:
-        await mark_payment_status(order_id or payment_id or "unknown", status="bad_payload", payment_id=payment_id, raw=payload)
+        await mark_payment_status(pay_key, status="bad_payload", payment_id=payment_id, raw=payload)
         raise HTTPException(status_code=400, detail="plan is missing in webhook payload (lite/pro)")
 
-    paid = _is_paid(payload)
-    if not paid:
-        await mark_payment_status(order_id or payment_id or "unknown", status="not_paid", payment_id=payment_id, raw=payload)
+    if not _is_paid(payload):
+        await mark_payment_status(pay_key, status="not_paid", payment_id=payment_id, raw=payload)
         return JSONResponse({"ok": True, "received": True, "paid": False})
 
     await grant_paid_access(
@@ -388,16 +373,17 @@ async def payshark_webhook(request: Request) -> JSONResponse:
         raw=payload,
     )
 
-    # Optional notify user in Telegram
     if NOTIFY_ON_PAYMENT:
         bot = getattr(app.state, "bot", None)
         if bot:
             try:
-                txt = "✅ Оплата получена. Подписка LITE активирована на 30 дней." if plan == "lite" else "✅ Оплата получена. Подписка PRO активирована на 30 дней."
+                txt = (
+                    "✅ Оплата получена. Подписка LITE активирована на 30 дней."
+                    if plan == "lite"
+                    else "✅ Оплата получена. Подписка PRO активирована на 30 дней."
+                )
                 await bot.send_message(chat_id, txt)
             except Exception:
                 pass
 
     return JSONResponse({"ok": True})
-
-
