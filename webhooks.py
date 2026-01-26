@@ -18,15 +18,15 @@ from db import (
 )
 
 # -----------------------------
-# Settings
+# Settings (PayShark only)
 # -----------------------------
-USE_TRIBUTE = os.getenv("USE_TRIBUTE", "false").lower() == "true"
 NOTIFY_ON_PAYMENT = os.getenv("NOTIFY_ON_PAYMENT", "true").lower() == "true"
 
 PAYSHARK_WEBHOOK_SECRET = os.getenv("PAYSHARK_WEBHOOK_SECRET", "").strip()
 
-LITE_PRICE = float(os.getenv("LITE_PRICE") or os.getenv("TRIBUTE_LITE_PRICE", "200"))
-PRO_PRICE = float(os.getenv("PRO_PRICE") or os.getenv("TRIBUTE_PRO_PRICE", "300"))
+LITE_PRICE = float(os.getenv("LITE_PRICE", "200"))
+PRO_PRICE = float(os.getenv("PRO_PRICE", "300"))
+
 
 app = FastAPI()
 
