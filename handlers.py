@@ -1369,9 +1369,26 @@ async def cb_pay_plan(call: CallbackQuery):
                 log.exception('Payshark H2H error | chat_id=%s plan=%s ext=%s', chat_id, plan, external_id)
         except Exception:
             log.exception('Payshark H2H error (logging failed)')
-        await call.message.answer(
-            f"💳 Оплата временно недоступна.\nКод: {code}\nНапишите в поддержку: {SUPPORT_CONTACT}"
-        )
+        # Покажем человеку понятную причину, если Payshark вернул её текстом (HTTP 200 + success=false).
+        user_reason = None
+        if msg.startswith("Payshark H2H error:"):
+            user_reason = msg.replace("Payshark H2H error:", "").strip()
+        elif "Подходящие платежные реквизиты" in msg:
+            user_reason = "Подходящие платежные реквизиты не найдены (метод оплаты не настроен у мерчанта)."
+
+        if user_reason:
+            await call.message.answer(
+                "💳 Оплата временно недоступна.\n"
+                f"Причина: {user_reason}\n"
+                f"Код: {code}\n"
+                f"Поддержка: {SUPPORT_CONTACT}"
+            )
+        else:
+            await call.message.answer(
+                "💳 Оплата временно недоступна.\n"
+                f"Код: {code}\n"
+                f"Поддержка: {SUPPORT_CONTACT}"
+            )
         await call.answer()
         return
 

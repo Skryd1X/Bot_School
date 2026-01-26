@@ -128,6 +128,24 @@ class PaysharkClient:
         if r.status_code >= 400:
             raise RuntimeError(f"Payshark H2H HTTP {r.status_code}: {r.text[:1200]}")
 
+        # Важно: Payshark может вернуть HTTP 200, но success=false / errors=... —
+        # тогда сделка НЕ создана, и нужно показать понятную причину.
+        if isinstance(payload, dict):
+            if payload.get("success") is False:
+                msg = str(payload.get("message") or "Unknown error")
+                errs = payload.get("errors")
+                if errs:
+                    msg = f"{msg} | errors={errs}"
+                raise RuntimeError(f"Payshark H2H error: {msg}")
+
+            # Иногда приходит формат {message: ..., errors: {...}} без поля success
+            if "errors" in payload and "message" in payload and "data" not in payload:
+                msg = str(payload.get("message") or "Validation error")
+                errs = payload.get("errors")
+                if errs:
+                    msg = f"{msg} | errors={errs}"
+                raise RuntimeError(f"Payshark H2H error: {msg}")
+
         obj = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
         if not isinstance(obj, dict):
             raise RuntimeError(f"Unexpected Payshark H2H response: {payload!r}")
