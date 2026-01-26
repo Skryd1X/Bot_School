@@ -6,7 +6,7 @@ import datetime as dt
 from typing import Any, Dict, Optional, Tuple
 
 import asyncio
-from startbot import bot, dp  # важно: startbot.py не должен стартовать polling при импорте
+
 
 @app.on_event("startup")
 async def on_startup():
