@@ -1335,7 +1335,6 @@ async def cb_pay_plan(call: CallbackQuery):
     callback_url = f"{PUBLIC_BASE_URL}/payshark/webhook"
 
     title = "LITE" if plan == "lite" else "PRO"
-
     try:
         client = PaysharkClient()
         order = await client.create_h2h_order(
@@ -1346,9 +1345,27 @@ async def cb_pay_plan(call: CallbackQuery):
             client_id=str(chat_id),
             description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
         )
-    except Exception:
+    except Exception as e:
+        import logging, re
+        log = logging.getLogger('payments')
+        code = 'H2H_ERR'
+        msg = str(e)
+        m = re.search(r'Payshark H2H HTTP\s+(\d{3})', msg)
+        if m:
+            code = f"H2H_HTTP_{m.group(1)}"
+
+        try:
+            import httpx
+            if isinstance(e, httpx.HTTPStatusError) and getattr(e, 'response', None) is not None:
+                resp = e.response
+                code = f"H2H_HTTP_{resp.status_code}"
+                log.error('Payshark H2H HTTP %s | chat_id=%s plan=%s ext=%s | body=%s', resp.status_code, chat_id, plan, external_id, (resp.text or '')[:1200])
+            else:
+                log.exception('Payshark H2H error | chat_id=%s plan=%s ext=%s', chat_id, plan, external_id)
+        except Exception:
+            log.exception('Payshark H2H error (logging failed)')
         await call.message.answer(
-            f"💳 Оплата временно недоступна.\nНапишите в поддержку: {SUPPORT_CONTACT}"
+            f"💳 Оплата временно недоступна.\nКод: {code}\nНапишите в поддержку: {SUPPORT_CONTACT}"
         )
         await call.answer()
         return
