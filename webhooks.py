@@ -22,6 +22,9 @@ app = FastAPI()
 NOTIFY_ON_PAYMENT = (os.getenv("NOTIFY_ON_PAYMENT") or "true").lower() == "true"
 
 PAYSHARK_WEBHOOK_SECRET = (os.getenv("PAYSHARK_WEBHOOK_SECRET") or "").strip()
+# Protect against common placeholder value.
+if PAYSHARK_WEBHOOK_SECRET.lower() in {"change-me", "changeme", ""}:
+    PAYSHARK_WEBHOOK_SECRET = ""
 
 LITE_PRICE = float(os.getenv("PAYSHARK_LITE_PRICE") or os.getenv("LITE_PRICE") or "200")
 PRO_PRICE = float(os.getenv("PAYSHARK_PRO_PRICE") or os.getenv("PRO_PRICE") or "300")
@@ -101,9 +104,12 @@ async def mark_payment_status(
     pay_id: str,
     status: str,
     payment_id: Optional[str] = None,
+    external_id: Optional[str] = None,
     raw: Optional[Dict[str, Any]] = None,
 ) -> None:
-    await payment_set_status(pay_id, status=status, raw_event=raw, external_id=payment_id)
+    # We prefer our own external_id (chat_id+plan...) if it exists.
+    ext = external_id or payment_id
+    await payment_set_status(pay_id, status=status, raw_event=raw, external_id=ext)
 
 
 async def grant_paid_access(
@@ -112,11 +118,12 @@ async def grant_paid_access(
     source: str = "payshark",
     payment_id: Optional[str] = None,
     order_id: Optional[str] = None,
+    external_id: Optional[str] = None,
     amount: Optional[float] = None,
     currency: Optional[str] = None,
     raw: Optional[Dict[str, Any]] = None,
 ) -> None:
-    pay_key = str(order_id or payment_id or f"{chat_id}:{plan}")
+    pay_key = str(order_id or payment_id or external_id or f"{chat_id}:{plan}")
 
     cur = await payment_get(pay_key)
     if cur and cur.get("processed") is True:
@@ -137,7 +144,7 @@ async def grant_paid_access(
         pay_key,
         status="paid",
         raw_event=raw,
-        external_id=order_id or payment_id,
+        external_id=external_id or order_id or payment_id,
     )
 
     await set_subscription(int(chat_id), plan=str(plan))
@@ -209,6 +216,43 @@ def _extract_chat_and_plan(payload: Dict[str, Any]) -> Tuple[Optional[int], Opti
         return chat_id, plan
 
     return chat_id, None
+
+
+def _parse_chat_plan_from_external_id(external_id: str) -> Tuple[Optional[int], Optional[str]]:
+    """Parse chat_id and plan from our external_id format.
+
+    Expected format: tg-<chat_id>-<plan>-<uuid> (uuid optional).
+    We parse very defensively so it keeps working if separators change slightly.
+    """
+    if not external_id:
+        return None, None
+    s = str(external_id).strip()
+    if not s:
+        return None, None
+    low = s.lower()
+
+    # Quick path for the intended format.
+    if low.startswith("tg-"):
+        parts = s.split("-")
+        # tg - chat_id - plan - ...
+        if len(parts) >= 3:
+            chat = _parse_int(parts[1])
+            plan = str(parts[2] or "").strip().lower()
+            if plan in {"lite", "pro"}:
+                return chat, plan
+
+    # Fallback: try to find ...<digits>...<lite/pro>... in the string
+    plan = "pro" if "pro" in low else ("lite" if "lite" in low else None)
+    chat = None
+    try:
+        import re
+
+        m = re.search(r"(\d{5,})", low)
+        if m:
+            chat = _parse_int(m.group(1))
+    except Exception:
+        pass
+    return chat, plan
 
 
 def _extract_payment_ids(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
@@ -311,8 +355,26 @@ async def payshark_webhook(request: Request) -> JSONResponse:
     _verify_signature_if_possible(request, raw_body)
 
     payment_id, order_id = _extract_payment_ids(payload)
+    external_id = _first(
+        payload.get("external_id"),
+        _get(payload, "data.external_id"),
+        _get(payload, "data.payment.external_id"),
+        _get(payload, "payment.external_id"),
+    )
     amount, currency = _extract_amount_currency(payload)
     chat_id, plan = _extract_chat_and_plan(payload)
+
+    # If meta is missing, decode from external_id (our H2H flow).
+    if (not chat_id or not plan) and external_id:
+        c2, p2 = _parse_chat_plan_from_external_id(str(external_id))
+        chat_id = chat_id or c2
+        plan = plan or p2
+
+    # Sometimes providers put our external_id into order_id field.
+    if (not chat_id or not plan) and order_id and str(order_id).lower().startswith("tg-"):
+        c2, p2 = _parse_chat_plan_from_external_id(str(order_id))
+        chat_id = chat_id or c2
+        plan = plan or p2
 
     if plan is None and amount is not None:
         if abs(amount - LITE_PRICE) < 0.0001:
@@ -320,25 +382,25 @@ async def payshark_webhook(request: Request) -> JSONResponse:
         elif abs(amount - PRO_PRICE) < 0.0001:
             plan = "pro"
 
-    if not chat_id and order_id:
-        p = await get_payment(order_id)
+    if not chat_id and (order_id or external_id):
+        p = await get_payment(str(order_id or external_id))
         if p and p.get("chat_id"):
             chat_id = int(p["chat_id"])
             if not plan and p.get("plan"):
                 plan = str(p["plan"]).lower()
 
-    pay_key = order_id or payment_id or "unknown"
+    pay_key = order_id or payment_id or (str(external_id) if external_id else "unknown")
 
     if not chat_id:
-        await mark_payment_status(pay_key, status="bad_payload", payment_id=payment_id, raw=payload)
+        await mark_payment_status(pay_key, status="bad_payload", payment_id=payment_id, external_id=str(external_id) if external_id else None, raw=payload)
         raise HTTPException(status_code=400, detail="chat_id is missing in webhook payload")
 
     if plan not in {"lite", "pro"}:
-        await mark_payment_status(pay_key, status="bad_payload", payment_id=payment_id, raw=payload)
+        await mark_payment_status(pay_key, status="bad_payload", payment_id=payment_id, external_id=str(external_id) if external_id else None, raw=payload)
         raise HTTPException(status_code=400, detail="plan is missing in webhook payload (lite/pro)")
 
     if not _is_paid(payload):
-        await mark_payment_status(pay_key, status="not_paid", payment_id=payment_id, raw=payload)
+        await mark_payment_status(pay_key, status="not_paid", payment_id=payment_id, external_id=str(external_id) if external_id else None, raw=payload)
         return JSONResponse({"ok": True, "received": True, "paid": False})
 
     await grant_paid_access(
@@ -347,6 +409,7 @@ async def payshark_webhook(request: Request) -> JSONResponse:
         source="payshark",
         payment_id=payment_id,
         order_id=order_id,
+        external_id=str(external_id) if external_id else None,
         amount=amount,
         currency=currency,
         raw=payload,

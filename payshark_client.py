@@ -12,6 +12,9 @@ class PaysharkOrder:
     status: str
     amount: str
     currency: str
+    # For H2H flow this is usually the requisites / details the user must pay to.
+    # Can be a dict, string, etc. We keep it raw.
+    payment_detail: Optional[Any] = None
     link_page_url: Optional[str] = None
     external_id: Optional[str] = None
     client_id: Optional[str] = None
@@ -39,10 +42,12 @@ class PaysharkClient:
         self._timeout = float(os.getenv("PAYSHARK_TIMEOUT_SEC", "20"))
 
     def _headers(self) -> Dict[str, str]:
-        # Payshark docs examples use `access-token` header
+        # Different Payshark docs/screens may show different auth headers.
+        # We send both common variants to maximize compatibility.
         return {
             "Accept": "application/json",
             "access-token": self.access_token,
+            "Authorization": f"Bearer {self.access_token}",
         }
 
     async def create_order(
@@ -91,6 +96,72 @@ class PaysharkClient:
             status=str(obj.get("status") or ""),
             amount=str(obj.get("amount") or amount),
             currency=str(obj.get("currency") or currency),
+            payment_detail=obj.get("payment_detail") if isinstance(obj, dict) else None,
+            link_page_url=str(link) if link else None,
+            external_id=str(obj.get("external_id") or external_id),
+            client_id=str(obj.get("client_id") or client_id),
+            raw=obj,
+        )
+
+    async def create_h2h_order(
+        self,
+        *,
+        amount: str,
+        currency: str,
+        external_id: str,
+        callback_url: str,
+        client_id: str,
+        description: str = "",
+    ) -> PaysharkOrder:
+        """Create a Host2Host (H2H) order.
+
+        Payshark H2H expects creating a deal via POST /api/h2h/order.
+        Exact field names can vary across their versions, so we send the most
+        common ones and parse response defensively.
+        """
+
+        url = f"{self.base_url}/api/h2h/order"
+
+        data: Dict[str, Any] = {
+            "merchant_id": self.merchant_id,
+            "amount": str(amount),
+            "currency": str(currency),
+            "external_id": str(external_id),
+            "callback_url": str(callback_url),
+            "client_id": str(client_id),
+        }
+        if description:
+            data["description"] = str(description)
+
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.post(url, headers=self._headers(), data=data)
+            r.raise_for_status()
+            payload = r.json()
+
+        obj = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+        if not isinstance(obj, dict):
+            raise RuntimeError(f"Unexpected Payshark H2H response: {payload!r}")
+
+        order_id = str(obj.get("order_id") or obj.get("id") or "")
+        if not order_id:
+            raise RuntimeError(f"Payshark H2H response missing order_id: {payload!r}")
+
+        # Different implementations may use different names.
+        link = obj.get("link_page_url") or obj.get("payment_link") or obj.get("url")
+        payment_detail = (
+            obj.get("payment_detail")
+            or obj.get("paymentDetails")
+            or obj.get("requisites")
+            or obj.get("requisite")
+            or obj.get("details")
+        )
+
+        return PaysharkOrder(
+            order_id=order_id,
+            status=str(obj.get("status") or ""),
+            amount=str(obj.get("amount") or amount),
+            currency=str(obj.get("currency") or currency),
+            payment_detail=payment_detail,
             link_page_url=str(link) if link else None,
             external_id=str(obj.get("external_id") or external_id),
             client_id=str(obj.get("client_id") or client_id),
@@ -114,7 +185,41 @@ class PaysharkClient:
             status=str(obj.get("status") or ""),
             amount=str(obj.get("amount") or ""),
             currency=str(obj.get("currency") or ""),
+            payment_detail=obj.get("payment_detail") if isinstance(obj, dict) else None,
             link_page_url=str(obj.get("link_page_url") or obj.get("payment_link") or obj.get("url") or "") or None,
+            external_id=str(obj.get("external_id") or "") or None,
+            client_id=str(obj.get("client_id") or "") or None,
+            raw=obj,
+        )
+
+    async def get_h2h_order(self, order_id: str) -> PaysharkOrder:
+        url = f"{self.base_url}/api/h2h/order/{order_id}"
+
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.get(url, headers=self._headers())
+            r.raise_for_status()
+            payload = r.json()
+
+        obj = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+        if not isinstance(obj, dict):
+            raise RuntimeError(f"Unexpected Payshark H2H response: {payload!r}")
+
+        link = obj.get("link_page_url") or obj.get("payment_link") or obj.get("url")
+        payment_detail = (
+            obj.get("payment_detail")
+            or obj.get("paymentDetails")
+            or obj.get("requisites")
+            or obj.get("requisite")
+            or obj.get("details")
+        )
+
+        return PaysharkOrder(
+            order_id=str(obj.get("order_id") or obj.get("id") or order_id),
+            status=str(obj.get("status") or ""),
+            amount=str(obj.get("amount") or ""),
+            currency=str(obj.get("currency") or ""),
+            payment_detail=payment_detail,
+            link_page_url=str(link) if link else None,
             external_id=str(obj.get("external_id") or "") or None,
             client_id=str(obj.get("client_id") or "") or None,
             raw=obj,

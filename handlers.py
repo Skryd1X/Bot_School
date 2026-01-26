@@ -1,8 +1,9 @@
 import os
+import json
 import asyncio
 import time
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlencode, urlparse, parse_qsl, urlunparse
 
 from aiogram import Router, F
@@ -36,7 +37,10 @@ from db import (
     get_or_create_ref_code, get_referral_stats,
     find_user_by_ref_code, set_referrer_once,
     apply_promocode_access,
+    payment_create, payment_set_status,
 )
+
+from payshark_client import PaysharkClient, build_external_id
 
 from utils_export import pdf_from_answer_text
 from tts import tts_voice_ogg, split_for_tts
@@ -52,6 +56,8 @@ LITE_PRICE = (os.getenv("PAYSHARK_LITE_PRICE") or os.getenv("LITE_PRICE_RUB") or
 PRO_PRICE = (os.getenv("PAYSHARK_PRO_PRICE") or os.getenv("PRO_PRICE_RUB") or os.getenv("PRO_PRICE") or os.getenv("TRIBUTE_PRO_PRICE") or "299.99").strip()
 PAYSHARK_LITE_URL = os.getenv("PAYSHARK_LITE_URL", "").strip()
 PAYSHARK_PRO_URL = os.getenv("PAYSHARK_PRO_URL", "").strip()
+PAYSHARK_CURRENCY = (os.getenv("PAYSHARK_CURRENCY") or "RUB").strip() or "RUB"
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@gptEDU_support").strip() or "@gptEDU_support"
 PROMO_CODE = os.getenv("PROMO_CODE", "uStudyPromoTest").strip()
 PROMO_PRO_DAYS = int(os.getenv("PROMO_PRO_DAYS", "365"))
@@ -349,6 +355,49 @@ def payshark_plan_url(plan: str, chat_id: int, username: Optional[str]) -> str:
     base = base.replace("{chat_id}", str(chat_id)).replace("{user_id}", str(chat_id)).replace("{client_id}", str(chat_id)).replace("{plan}", plan)
     base = base.replace("{username}", (username or ""))
     return _inject_query(base, {"chat_id": str(chat_id), "client_id": str(chat_id), "plan": plan, "username": username or ""})
+
+
+def _as_float_price(value: str) -> float:
+    s = (value or "").strip().replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _format_payment_detail(detail: Any) -> str:
+    """Pretty-format payment_detail from H2H response (string/dict/list/etc)."""
+    if detail is None:
+        return ""
+    if isinstance(detail, str):
+        return detail.strip()
+    if isinstance(detail, (int, float, bool)):
+        return str(detail)
+    if isinstance(detail, list):
+        parts: List[str] = []
+        for it in detail:
+            s = _format_payment_detail(it)
+            if s:
+                parts.append(s)
+        return "\n".join(parts)
+    if isinstance(detail, dict):
+        lines: List[str] = []
+        for k, v in detail.items():
+            if v is None:
+                continue
+            kk = str(k).strip()
+            vv = v
+            if isinstance(v, (dict, list)):
+                vv = json.dumps(v, ensure_ascii=False)
+            vv_s = str(vv).strip()
+            if not vv_s:
+                continue
+            if kk:
+                lines.append(f"• {kk}: {vv_s}")
+            else:
+                lines.append(f"• {vv_s}")
+        return "\n".join(lines)
+    return str(detail)
 
 async def get_current_mode(chat_id: int) -> str:
     prefs = await get_prefs(chat_id)
@@ -1271,24 +1320,86 @@ async def cb_pay_plan(call: CallbackQuery):
     chat_id = call.message.chat.id
     username = (call.from_user.username or "").strip() if call.from_user else ""
     plan = "lite" if call.data == "pay_lite" else "pro"
-    price = LITE_PRICE if plan == "lite" else PRO_PRICE
-    url = payshark_plan_url(plan, chat_id, username)
-    if not url:
-        await call.message.answer(f"💳 Оплата временно недоступна. Напишите в поддержку: {SUPPORT_CONTACT}")
+    price_str = LITE_PRICE if plan == "lite" else PRO_PRICE
+    amount = _as_float_price(price_str)
+
+    if not PUBLIC_BASE_URL:
+        await call.message.answer(
+            "⚠️ Оплата временно недоступна (не настроен PUBLIC_BASE_URL).\n"
+            f"Напишите в поддержку: {SUPPORT_CONTACT}"
+        )
         await call.answer()
         return
+
+    external_id = build_external_id(chat_id, plan)
+    callback_url = f"{PUBLIC_BASE_URL}/payshark/webhook"
+
     title = "LITE" if plan == "lite" else "PRO"
-    text = (
-        f"💳 Оплата {title} через PayShark\n\n"
-        f"Сумма: {price} ₽\n\n"
+
+    try:
+        client = PaysharkClient()
+        order = await client.create_h2h_order(
+            amount=str(amount),
+            currency=PAYSHARK_CURRENCY,
+            external_id=external_id,
+            callback_url=callback_url,
+            client_id=str(chat_id),
+            description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
+        )
+    except Exception:
+        await call.message.answer(
+            f"💳 Оплата временно недоступна.\nНапишите в поддержку: {SUPPORT_CONTACT}"
+        )
+        await call.answer()
+        return
+
+    # фиксируем в Mongo
+    try:
+        await payment_create(
+            pay_id=str(order.order_id),
+            chat_id=int(chat_id),
+            plan=str(plan),
+            amount=float(amount),
+            currency=str(order.currency or PAYSHARK_CURRENCY or "RUB"),
+            provider="payshark",
+            raw_create=order.raw,
+        )
+        await payment_set_status(
+            str(order.order_id),
+            status=str(order.status or "created"),
+            raw_event=None,
+            external_id=str(order.external_id or external_id),
+        )
+    except Exception:
+        # если БД недоступна, всё равно покажем пользователю реквизиты
+        pass
+
+    detail_txt = _format_payment_detail(order.payment_detail)
+
+    text_parts: List[str] = [
+        f"💳 Оплата {title} через PayShark (H2H)",
+        "",
+        f"Сумма: {price_str} ₽",
+    ]
+    if order.order_id:
+        text_parts.append(f"ID сделки: {order.order_id}")
+    text_parts.append("")
+    if detail_txt:
+        text_parts.append("Реквизиты для оплаты:")
+        text_parts.append(detail_txt)
+        text_parts.append("")
+
+    text_parts.append(
         "После оплаты доступ откроется автоматически. "
-        f"Если в течение 2–3 минут не открылся — напишите в поддержку {SUPPORT_CONTACT} и приложите чек/ID платежа."
+        f"Если в течение 2–3 минут не открылся — напишите в поддержку {SUPPORT_CONTACT} и приложите чек/ID сделки."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Перейти к оплате", url=url)],
-        [InlineKeyboardButton(text="🧾 Проверить статус", callback_data="pay_check_status")],
-    ])
-    await call.message.answer(text, reply_markup=kb)
+
+    kb_rows: List[List[InlineKeyboardButton]] = []
+    if order.link_page_url:
+        kb_rows.append([InlineKeyboardButton(text="💳 Перейти к оплате", url=order.link_page_url)])
+    kb_rows.append([InlineKeyboardButton(text="🧾 Проверить статус", callback_data="pay_check_status")])
+
+    await call.message.answer("\n".join(text_parts), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await call.answer()
 
 @router.callback_query(F.data == "pay_check_status")
