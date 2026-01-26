@@ -25,6 +25,44 @@ def build_external_id(chat_id: int, plan: str) -> str:
     # tg-<chat_id>-<plan>-<uuid>
     return f"tg-{chat_id}-{plan}-{uuid.uuid4().hex}"
 
+import re
+from decimal import Decimal, InvalidOperation
+
+
+def _normalize_currency(cur: str) -> str:
+    cur = (cur or "").upper().strip()
+    # Extract ISO-like 3-letter code from anything like "RUB ₽"
+    m = re.search(r"[A-Z]{3}", cur)
+    code = m.group(0) if m else ""
+    allowed = {"RUB", "RUR", "USD", "EUR", "KZT", "UZS"}
+    return code if code in allowed else "RUB"
+
+
+def _normalize_amount_int(val: Any) -> int:
+    # Payshark H2H требует целое число в поле amount
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return int(val)
+    if isinstance(val, float):
+        return int(round(val))
+    s = str(val or "").strip()
+    s = s.replace(" ", "")
+    # keep digits and separators only
+    s = re.sub(r"[^0-9,\.\-]", "", s)
+    s = s.replace(",", ".")
+    if not s:
+        return 0
+    try:
+        d = Decimal(s)
+        return int(d.to_integral_value(rounding="ROUND_HALF_UP"))
+    except (InvalidOperation, ValueError):
+        try:
+            return int(round(float(s)))
+        except Exception:
+            return 0
+
+
 
 class PaysharkClient:
     def __init__(self) -> None:
@@ -77,8 +115,8 @@ class PaysharkClient:
         # Send as form-encoded (matches their curl style)
         data = {
             "merchant_id": self.merchant_id,
-            "amount": str(amount),
-            "currency": str(currency),
+            "amount": amount_i,
+            "currency": str(currency_code),
             "external_id": external_id,
             "client_id": str(client_id),
             "callback_url": callback_url,
@@ -106,7 +144,7 @@ class PaysharkClient:
             order_id=order_id,
             status=str(obj.get("status") or ""),
             amount=str(obj.get("amount") or amount),
-            currency=str(obj.get("currency") or currency),
+            currency=str(obj.get("currency") or currency_code),
             payment_detail=obj.get("payment_detail") if isinstance(obj, dict) else None,
             link_page_url=str(link) if link else None,
             external_id=str(obj.get("external_id") or external_id),
@@ -117,7 +155,7 @@ class PaysharkClient:
     async def create_h2h_order(
         self,
         *,
-        amount: str,
+        amount: Any,
         currency: str,
         external_id: str,
         callback_url: str,
@@ -135,11 +173,14 @@ class PaysharkClient:
 
         url = f"{self.base_url}/api/h2h/order"
 
+        amount_i = _normalize_amount_int(amount)
+        currency_code = _normalize_currency(currency)
+
         data: Dict[str, Any] = {
             # snake_case
             "merchant_id": self.merchant_id,
-            "amount": str(amount),
-            "currency": str(currency),
+            "amount": amount_i,
+            "currency": str(currency_code),
             "external_id": str(external_id),
             "callback_url": str(callback_url),
             "client_id": str(client_id),
@@ -156,7 +197,10 @@ class PaysharkClient:
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             if body_mode == "form":
-                r = await client.post(url, headers=self._headers(), data=data)
+                data_form = dict(data)
+                data_form["amount"] = str(amount_i)
+                data_form["currency"] = str(currency_code)
+                r = await client.post(url, headers=self._headers(), data=data_form)
             else:
                 r = await client.post(url, headers=self._headers(), json=data)
 
@@ -190,7 +234,7 @@ class PaysharkClient:
             order_id=order_id,
             status=str(obj.get("status") or ""),
             amount=str(obj.get("amount") or amount),
-            currency=str(obj.get("currency") or currency),
+            currency=str(obj.get("currency") or currency_code),
             payment_detail=payment_detail,
             link_page_url=str(link) if link else None,
             external_id=str(obj.get("external_id") or external_id),

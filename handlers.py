@@ -365,6 +365,16 @@ def _as_float_price(value: str) -> float:
         return 0.0
 
 
+def _normalize_currency(cur: str) -> str:
+    import re
+
+    cur = (cur or "").upper().strip()
+    m = re.search(r"[A-Z]{3}", cur)
+    code = m.group(0) if m else ""
+    allowed = {"RUB", "RUR", "USD", "EUR", "KZT", "UZS"}
+    return code if code in allowed else "RUB"
+
+
 def _format_payment_detail(detail: Any) -> str:
     """Pretty-format payment_detail from H2H response (string/dict/list/etc)."""
     if detail is None:
@@ -1321,7 +1331,9 @@ async def cb_pay_plan(call: CallbackQuery):
     username = (call.from_user.username or "").strip() if call.from_user else ""
     plan = "lite" if call.data == "pay_lite" else "pro"
     price_str = LITE_PRICE if plan == "lite" else PRO_PRICE
-    amount = _as_float_price(price_str)
+    amount_f = _as_float_price(price_str)
+    amount_i = int(round(amount_f))
+    currency_norm = _normalize_currency(PAYSHARK_CURRENCY)
 
     if not PUBLIC_BASE_URL:
         await call.message.answer(
@@ -1338,8 +1350,8 @@ async def cb_pay_plan(call: CallbackQuery):
     try:
         client = PaysharkClient()
         order = await client.create_h2h_order(
-            amount=str(amount),
-            currency=PAYSHARK_CURRENCY,
+            amount=amount_i,
+            currency=currency_norm,
             external_id=external_id,
             callback_url=callback_url,
             client_id=str(chat_id),
@@ -1376,8 +1388,8 @@ async def cb_pay_plan(call: CallbackQuery):
             pay_id=str(order.order_id),
             chat_id=int(chat_id),
             plan=str(plan),
-            amount=float(amount),
-            currency=str(order.currency or PAYSHARK_CURRENCY or "RUB"),
+            amount=float(amount_i),
+            currency=str(order.currency or currency_norm or "RUB"),
             provider="payshark",
             raw_create=order.raw,
         )
