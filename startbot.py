@@ -16,8 +16,8 @@ if not BOT_TOKEN:
 
 MODE = (os.getenv("MODE") or "polling").strip().lower()
 
-USE_TRIBUTE = (os.getenv("USE_TRIBUTE") or "false").lower() == "true"
-RUN_TRIBUTE_WEBHOOK = (os.getenv("RUN_TRIBUTE_WEBHOOK") or "false").lower() == "true"
+USE_PAYSHARK = (os.getenv("USE_PAYSHARK") or "false").lower() == "true"
+RUN_WEBHOOK_SERVER = (os.getenv("RUN_WEBHOOK_SERVER") or "false").lower() == "true"
 
 WEBHOOK_HOST = (os.getenv("WEBHOOK_HOST") or "0.0.0.0").strip()
 WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT") or "8080")
@@ -28,7 +28,7 @@ def _want_webhook_server() -> bool:
         return True
     if MODE in {"both", "hybrid"}:
         return True
-    return bool(USE_TRIBUTE and RUN_TRIBUTE_WEBHOOK)
+    return bool(RUN_WEBHOOK_SERVER or USE_PAYSHARK)
 
 
 def _want_polling() -> bool:
@@ -39,14 +39,18 @@ def _want_polling() -> bool:
     return True
 
 
-async def run_polling():
-    from aiogram import Bot, Dispatcher
-    from aiogram.fsm.storage.memory import MemoryStorage
+async def _create_bot():
+    from aiogram import Bot
     from aiogram.client.session.aiohttp import AiohttpSession
-    from handlers import router
 
     session = AiohttpSession(timeout=120)
-    bot = Bot(token=BOT_TOKEN, session=session)
+    return Bot(token=BOT_TOKEN, session=session)
+
+
+async def run_polling(bot):
+    from aiogram import Dispatcher
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from handlers import router
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
@@ -57,16 +61,15 @@ async def run_polling():
     me = await bot.get_me()
     log.info("Polling started: @%s (id=%s)", me.username, me.id)
 
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        with contextlib.suppress(Exception):
-            await bot.session.close()
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
-async def run_webhook_server():
+async def run_webhook_server(bot):
     import uvicorn
     from webhooks import app
+
+    # чтобы webhooks.py мог отправлять notify пользователю после оплаты
+    app.state.bot = bot
 
     config = uvicorn.Config(
         app=app,
@@ -109,28 +112,36 @@ async def _run_until_first_exception(tasks: list[asyncio.Task]):
 
 async def main():
     log.info(
-        "Mode=%s | polling=%s | webhook_server=%s | tribute=%s",
+        "Mode=%s | polling=%s | webhook_server=%s | payshark=%s",
         MODE,
         _want_polling(),
         _want_webhook_server(),
-        "on" if USE_TRIBUTE else "off",
+        "on" if USE_PAYSHARK else "off",
     )
 
-    if MODE == "webhook" and not (USE_TRIBUTE or RUN_TRIBUTE_WEBHOOK):
-        log.warning("MODE=webhook, but USE_TRIBUTE/RUN_TRIBUTE_WEBHOOK are disabled")
+    if MODE == "webhook" and not _want_webhook_server():
+        log.warning("MODE=webhook, but webhook_server is disabled by settings")
+
+    if USE_PAYSHARK and not _want_webhook_server():
+        log.warning("USE_PAYSHARK=true, but webhook server will not start (callbacks may not work)")
+
+    bot = await _create_bot()
 
     tasks: list[asyncio.Task] = []
+    try:
+        if _want_polling():
+            tasks.append(asyncio.create_task(run_polling(bot), name="polling"))
 
-    if _want_polling():
-        tasks.append(asyncio.create_task(run_polling(), name="polling"))
+        if _want_webhook_server():
+            tasks.append(asyncio.create_task(run_webhook_server(bot), name="webhook_server"))
 
-    if _want_webhook_server():
-        tasks.append(asyncio.create_task(run_webhook_server(), name="webhook_server"))
+        if not tasks:
+            raise RuntimeError("Nothing to run: check MODE/USE_PAYSHARK/RUN_WEBHOOK_SERVER")
 
-    if not tasks:
-        raise RuntimeError("Nothing to run: check MODE/USE_TRIBUTE/RUN_TRIBUTE_WEBHOOK")
-
-    await _run_until_first_exception(tasks)
+        await _run_until_first_exception(tasks)
+    finally:
+        with contextlib.suppress(Exception):
+            await bot.session.close()
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ db = client[MONGODB_DB]
 users = db["users"]
 history = db["history"]
 bookmarks = db["bookmarks"]
+payments = db["payments"]
 
 Plan = Literal["free", "lite", "pro"]
 
@@ -30,6 +31,10 @@ LITE_TEXT_LIMIT = int(os.getenv("LITE_TEXT_LIMIT", "300"))
 LITE_PHOTO_LIMIT = int(os.getenv("LITE_PHOTO_LIMIT", "120"))
 
 UNLIMITED = 10**12
+
+PAYSHARK_LITE_PRICE = os.getenv("PAYSHARK_LITE_PRICE") or os.getenv("LITE_PRICE_RUB") or os.getenv("TRIBUTE_LITE_PRICE") or "199.99"
+PAYSHARK_PRO_PRICE = os.getenv("PAYSHARK_PRO_PRICE") or os.getenv("PRO_PRICE_RUB") or os.getenv("TRIBUTE_PRO_PRICE") or "299.99"
+SUBSCRIPTION_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
 
 
 def _now_utc() -> dt.datetime:
@@ -90,6 +95,15 @@ def _merge_defaults(p: Dict[str, Any] | None) -> Dict[str, Any]:
         else:
             out[k] = default
     return out
+
+
+def _as_price(value: str) -> str:
+    s = (value or "").strip().replace(",", ".")
+    try:
+        v = float(s)
+        return f"{v:.2f}".rstrip("0").rstrip(".") if "." in f"{v:.2f}" else f"{v:.2f}"
+    except Exception:
+        return s or "0"
 
 
 async def ensure_user(chat_id: int) -> dict:
@@ -158,13 +172,16 @@ async def can_use(doc: dict, kind: Literal["text", "photo"]) -> Tuple[bool, str]
     plan = doc.get("plan", "free")
     active = await _is_subscription_active(doc)
 
+    lite_price = _as_price(PAYSHARK_LITE_PRICE)
+    pro_price = _as_price(PAYSHARK_PRO_PRICE)
+
     def _msg_free() -> str:
         return (
             "🚫 Бесплатные лимиты закончились.\n\n"
             "Оформите подписку, чтобы продолжить:\n"
-            f"• Lite — 199.99 ₽ / 30 дней (до {LITE_TEXT_LIMIT} текстовых и до {LITE_PHOTO_LIMIT} фото-решений в месяц)\n"
-            "• Pro  — 299.99 ₽ / 30 дней (безлимит + приоритет)\n"
-            "Команды: /buy199 или /buy299"
+            f"• LITE — {lite_price} ₽ / {SUBSCRIPTION_DAYS} дней (до {LITE_TEXT_LIMIT} текстовых и до {LITE_PHOTO_LIMIT} фото-решений в месяц)\n"
+            f"• PRO — {pro_price} ₽ / {SUBSCRIPTION_DAYS} дней (безлимит + приоритет)\n\n"
+            "Откройте «📦 Доступные пакеты» или используйте команду /plan."
         )
 
     def _msg_lite() -> str:
@@ -172,14 +189,13 @@ async def can_use(doc: dict, kind: Literal["text", "photo"]) -> Tuple[bool, str]
             return (
                 f"🚫 Достигнут лимит LITE по текстовым запросам: {tu}/{text_limit} за месяц.\n\n"
                 "Продлите LITE на следующий месяц или перейдите на PRO (безлимит).\n"
-                "Команды: /buy199 или /buy299"
+                "Откройте «📦 Доступные пакеты» или используйте команду /plan."
             )
-        else:
-            return (
-                f"🚫 Достигнут лимит LITE по решениям с фото: {pu}/{photo_limit} за месяц.\n\n"
-                "Продлите LITE на следующий месяц или перейдите на PRO (безлимит).\n"
-                "Команды: /buy199 или /buy299"
-            )
+        return (
+            f"🚫 Достигнут лимит LITE по решениям с фото: {pu}/{photo_limit} за месяц.\n\n"
+            "Продлите LITE на следующий месяц или перейдите на PRO (безлимит).\n"
+            "Откройте «📦 Доступные пакеты» или используйте команду /plan."
+        )
 
     if kind == "text":
         if tu < text_limit:
@@ -203,7 +219,7 @@ async def inc_usage(chat_id: int, kind: Literal["text", "photo"]) -> None:
     await users.update_one({"chat_id": chat_id}, {"$inc": {field: 1}})
 
 
-async def set_subscription(chat_id: int, plan: Plan, days: int = 30) -> dict:
+async def set_subscription(chat_id: int, plan: Plan, days: int = SUBSCRIPTION_DAYS) -> dict:
     now = _now_utc()
     exp = now + dt.timedelta(days=days)
     await users.update_one(
@@ -215,10 +231,6 @@ async def set_subscription(chat_id: int, plan: Plan, days: int = 30) -> dict:
 
 
 async def apply_promocode_access(chat_id: int, code: str, days: int = 365) -> tuple[bool, dt.datetime]:
-    """
-    Активирует доступ PRO по промокоду и фиксирует это в базе.
-    Возвращает (activated, expires_at).
-    """
     now = _now_utc()
     try:
         days_i = max(1, int(days))
@@ -248,7 +260,6 @@ async def apply_promocode_access(chat_id: int, code: str, days: int = 365) -> tu
         upsert=True,
     )
 
-    # Если промо уже было выставлено параллельно, просто вернём фактическую дату
     if getattr(res, "matched_count", 0) == 0 and getattr(res, "upserted_id", None) is None:
         u = await users.find_one({"chat_id": chat_id}, {"promo": 1, "sub_expires_at": 1})
         p2 = (u or {}).get("promo") if isinstance((u or {}).get("promo"), dict) else None
@@ -256,7 +267,6 @@ async def apply_promocode_access(chat_id: int, code: str, days: int = 365) -> tu
         return False, exp2
 
     return True, exp
-
 
 
 async def is_pro_active(chat_id: int) -> bool:
@@ -278,7 +288,7 @@ async def get_status_text(chat_id: int) -> str:
     exp = _to_aware_utc(doc.get("sub_expires_at"))
 
     if active and plan == "pro":
-        exp_s = exp.strftime("%Y-%m-%d %H:%M UTC")
+        exp_s = exp.strftime("%Y-%m-%d %H:%M UTC") if exp else ""
         return (
             f"📦 План: PRO (активен до {exp_s})\n"
             f"Текстовые запросы: безлимит (использовано {tu})\n"
@@ -286,7 +296,7 @@ async def get_status_text(chat_id: int) -> str:
         )
 
     if active and plan == "lite":
-        exp_s = exp.strftime("%Y-%m-%d %H:%M UTC")
+        exp_s = exp.strftime("%Y-%m-%d %H:%M UTC") if exp else ""
         return (
             f"📦 План: LITE (активен до {exp_s})\n"
             f"Текстовые запросы: {tu}/{text_limit}\n"
@@ -294,10 +304,10 @@ async def get_status_text(chat_id: int) -> str:
         )
 
     return (
-        f"📦 План: FREE\n"
+        "📦 План: FREE\n"
         f"Текстовые запросы: {tu}/{text_limit}\n"
         f"Решения по фото: {pu}/{photo_limit}\n\n"
-        f"Обновите план: /plan"
+        "Оформить подписку: /plan"
     )
 
 
@@ -508,6 +518,72 @@ async def get_last_bookmark(chat_id: int) -> Optional[str]:
     return (doc or {}).get("content")
 
 
+async def payment_create(
+    pay_id: str,
+    chat_id: int,
+    plan: str,
+    amount: float,
+    currency: str = "RUB",
+    provider: str = "payshark",
+    raw_create: Optional[Dict[str, Any]] = None,
+) -> bool:
+    now = _now_utc()
+    res = await payments.update_one(
+        {"_id": str(pay_id)},
+        {
+            "$setOnInsert": {
+                "_id": str(pay_id),
+                "provider": str(provider),
+                "chat_id": int(chat_id),
+                "plan": str(plan),
+                "amount": float(amount),
+                "currency": str(currency),
+                "status": "created",
+                "created_at": now,
+                "processed": False,
+            },
+            "$set": {
+                "updated_at": now,
+                "raw_create": raw_create,
+            },
+        },
+        upsert=True,
+    )
+    return bool(getattr(res, "upserted_id", None))
+
+
+async def payment_set_status(
+    pay_id: str,
+    status: str,
+    raw_event: Optional[Dict[str, Any]] = None,
+    external_id: Optional[str] = None,
+) -> None:
+    now = _now_utc()
+    set_doc: Dict[str, Any] = {"status": str(status), "updated_at": now}
+    if raw_event is not None:
+        set_doc["raw_event"] = raw_event
+    if external_id is not None:
+        set_doc["external_id"] = str(external_id)
+    await payments.update_one({"_id": str(pay_id)}, {"$set": set_doc}, upsert=True)
+
+
+async def payment_mark_processed(pay_id: str) -> bool:
+    now = _now_utc()
+    res = await payments.update_one(
+        {"_id": str(pay_id), "processed": {"$ne": True}},
+        {"$set": {"processed": True, "processed_at": now, "updated_at": now}},
+    )
+    return getattr(res, "modified_count", 0) == 1
+
+
+async def payment_get(pay_id: str) -> Optional[Dict[str, Any]]:
+    return await payments.find_one({"_id": str(pay_id)})
+
+
+async def payment_find_by_external_id(external_id: str) -> Optional[Dict[str, Any]]:
+    return await payments.find_one({"external_id": str(external_id)})
+
+
 REF_REWARD_BATCH = int(os.getenv("REF_BONUS_THRESHOLD", "6"))
 
 
@@ -621,3 +697,67 @@ async def process_referral_reward_if_needed(
         await extend_pro_months(referrer_id, months=1)
         return True, paid_count, referrer_id
     return False, paid_count, referrer_id
+
+
+# --- Compatibility layer for PayShark webhooks (older imports) ---
+
+async def create_payment_intent(plan: str, chat_id: int, username: str | None = None) -> dict | None:
+    # PayShark uses hosted payment links; intent is created on provider side.
+    # We keep this for backward compatibility with older webhook code.
+    return None
+
+
+async def get_payment(order_id: str | None = None, payment_id: str | None = None) -> dict | None:
+    key = str(order_id or payment_id or "").strip()
+    if not key:
+        return None
+    doc = await payment_get(key)
+    if doc:
+        return doc
+    # sometimes provider sends external_id separately
+    return await payment_find_by_external_id(key)
+
+
+async def mark_payment_status(payment_id: str, status: str, raw: dict | None = None) -> None:
+    key = str(payment_id or "").strip()
+    if not key:
+        return
+    await payment_set_status(key, status=str(status), raw_event=raw, external_id=key)
+
+
+async def grant_paid_access(chat_id: int, plan: str, payment_id: str | None = None, order_id: str | None = None) -> bool:
+    plan_s = str(plan or "").strip().lower()
+    if plan_s not in {"lite", "pro"}:
+        return False
+
+    pay_key = str(order_id or payment_id or f"{chat_id}:{plan_s}").strip()
+    doc = await payment_get(pay_key)
+    if not doc:
+        # create a minimal record so we can mark it processed idempotently
+        try:
+            amt = float(PAYSHARK_LITE_PRICE if plan_s == "lite" else PAYSHARK_PRO_PRICE)
+        except Exception:
+            amt = 0.0
+        await payment_create(
+            pay_id=pay_key,
+            chat_id=int(chat_id),
+            plan=plan_s,
+            amount=amt,
+            currency="RUB",
+            provider="payshark",
+            raw_create=None,
+        )
+        doc = await payment_get(pay_key)
+
+    if doc and doc.get("processed") is True:
+        return False
+
+    await payment_set_status(
+        pay_key,
+        status="paid",
+        raw_event=None,
+        external_id=str(order_id or payment_id or pay_key),
+    )
+    await set_subscription(int(chat_id), plan_s)
+    await payment_mark_processed(pay_key)
+    return True

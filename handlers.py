@@ -3,7 +3,7 @@ import asyncio
 import time
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode, urlparse, parse_qsl, urlunparse
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -48,10 +48,11 @@ MIN_INTERVAL_SEND = 1.1
 MIN_EDIT_INTERVAL = 0.25
 MAX_TG_LEN = 4096
 
-TRIBUTE_LITE_STARTAPP = os.getenv("TRIBUTE_LITE_STARTAPP", "")
-TRIBUTE_PRO_STARTAPP = os.getenv("TRIBUTE_PRO_STARTAPP", "")
-TRIBUTE_LITE_PRICE = os.getenv("TRIBUTE_LITE_PRICE", "200")
-TRIBUTE_PRO_PRICE = os.getenv("TRIBUTE_PRO_PRICE", "300")
+LITE_PRICE = (os.getenv("PAYSHARK_LITE_PRICE") or os.getenv("LITE_PRICE_RUB") or os.getenv("LITE_PRICE") or os.getenv("TRIBUTE_LITE_PRICE") or "199.99").strip()
+PRO_PRICE = (os.getenv("PAYSHARK_PRO_PRICE") or os.getenv("PRO_PRICE_RUB") or os.getenv("PRO_PRICE") or os.getenv("TRIBUTE_PRO_PRICE") or "299.99").strip()
+PAYSHARK_LITE_URL = os.getenv("PAYSHARK_LITE_URL", "").strip()
+PAYSHARK_PRO_URL = os.getenv("PAYSHARK_PRO_URL", "").strip()
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@gptEDU_support").strip() or "@gptEDU_support"
 PROMO_CODE = os.getenv("PROMO_CODE", "uStudyPromoTest").strip()
 PROMO_PRO_DAYS = int(os.getenv("PROMO_PRO_DAYS", "365"))
 
@@ -325,8 +326,29 @@ MODE_BUTTON_TEXT_TO_KEY: Dict[str, str] = {
     "📅 Учебный план по теме": "study_plan",
 }
 
-def tribute_url(code: str) -> str:
-    return f"https://t.me/tribute/app?startapp={code}"
+def _inject_query(url: str, extra: Dict[str, str]) -> str:
+    try:
+        u = urlparse(url)
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        for k, v in (extra or {}).items():
+            if v is None:
+                continue
+            vv = str(v).strip()
+            if vv == "":
+                continue
+            q[k] = vv
+        nq = urlencode(q)
+        return urlunparse((u.scheme, u.netloc, u.path, u.params, nq, u.fragment))
+    except Exception:
+        return url
+
+def payshark_plan_url(plan: str, chat_id: int, username: Optional[str]) -> str:
+    base = PAYSHARK_LITE_URL if plan == "lite" else PAYSHARK_PRO_URL
+    if not base:
+        return ""
+    base = base.replace("{chat_id}", str(chat_id)).replace("{user_id}", str(chat_id)).replace("{client_id}", str(chat_id)).replace("{plan}", plan)
+    base = base.replace("{username}", (username or ""))
+    return _inject_query(base, {"chat_id": str(chat_id), "client_id": str(chat_id), "plan": plan, "username": username or ""})
 
 async def get_current_mode(chat_id: int) -> str:
     prefs = await get_prefs(chat_id)
@@ -363,8 +385,8 @@ async def _plan_flags(chat_id: int) -> Tuple[bool, bool, bool]:
 
 def plans_kb(show_back: bool = False) -> InlineKeyboardMarkup:
     row = [
-        InlineKeyboardButton(text=f"🪙 LITE {TRIBUTE_LITE_PRICE} ₽", url=tribute_url(TRIBUTE_LITE_STARTAPP)),
-        InlineKeyboardButton(text=f"🚀 PRO {TRIBUTE_PRO_PRICE} ₽", url=tribute_url(TRIBUTE_PRO_STARTAPP)),
+        InlineKeyboardButton(text=f"🪙 LITE {LITE_PRICE} ₽", callback_data="pay_lite"),
+        InlineKeyboardButton(text=f"🚀 PRO {PRO_PRICE} ₽", callback_data="pay_pro"),
     ]
     kb: list[list[InlineKeyboardButton]] = [row]
     if show_back:
@@ -848,7 +870,7 @@ async def faq_questions(message: Message):
         "  Оплаченные услуги <b>не подлежат возврату</b>, так как оплата совершается добровольно, "
         "а до покупки есть возможность ознакомиться с функционалом.\n\n"
         "• <b>Как происходит оплата?</b>\n"
-        "  Через встроенные способы в боте. После оплаты доступ открывается автоматически.\n\n"
+        "  Через PayShark (платёжная форма). После оплаты доступ открывается автоматически.\n\n"
         "• <b>Что умеет бот?</b>\n"
         "  Он помогает <i>разобрать задачи, пояснить теорию, оформить решение</i>. "
         "Это помощник, а не полноценная замена преподавателя.\n\n"
@@ -1244,6 +1266,37 @@ async def cb_show_plans(call: CallbackQuery):
     await call.message.edit_text("Доступные пакеты:", reply_markup=plans_kb(show_back=True))
     await call.answer()
 
+@router.callback_query(F.data.in_(("pay_lite", "pay_pro")))
+async def cb_pay_plan(call: CallbackQuery):
+    chat_id = call.message.chat.id
+    username = (call.from_user.username or "").strip() if call.from_user else ""
+    plan = "lite" if call.data == "pay_lite" else "pro"
+    price = LITE_PRICE if plan == "lite" else PRO_PRICE
+    url = payshark_plan_url(plan, chat_id, username)
+    if not url:
+        await call.message.answer(f"💳 Оплата временно недоступна. Напишите в поддержку: {SUPPORT_CONTACT}")
+        await call.answer()
+        return
+    title = "LITE" if plan == "lite" else "PRO"
+    text = (
+        f"💳 Оплата {title} через PayShark\n\n"
+        f"Сумма: {price} ₽\n\n"
+        "После оплаты доступ откроется автоматически. "
+        f"Если в течение 2–3 минут не открылся — напишите в поддержку {SUPPORT_CONTACT} и приложите чек/ID платежа."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=url)],
+        [InlineKeyboardButton(text="🧾 Проверить статус", callback_data="pay_check_status")],
+    ])
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+@router.callback_query(F.data == "pay_check_status")
+async def cb_pay_check_status(call: CallbackQuery):
+    await show_subscriptions(call.message)
+    await call.answer()
+
+
 @router.callback_query(F.data == "back_to_subs")
 async def cb_back_to_subs(call: CallbackQuery):
     text = await get_status_text(call.message.chat.id)
@@ -1260,14 +1313,6 @@ async def cb_back_to_subs(call: CallbackQuery):
 @router.message(StateFilter('generating'))
 async def wait_response(message: Message):
     await safe_send(message, "⏳ Ответ генерируется... дождитесь окончания предыдущего запроса!")
-
-@router.message(F.text == "🧾 Мои подписки")
-async def _open_subs_direct(message: Message):
-    await show_subscriptions(message)
-
-@router.message(F.text == "🔼 Обновить план")
-async def _open_plans_direct(message: Message):
-    await kb_upgrade(message)
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def generate_answer(message: Message, state: FSMContext):
