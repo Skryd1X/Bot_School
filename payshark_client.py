@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+
 @dataclass
 class PaysharkOrder:
     order_id: str
@@ -16,9 +17,11 @@ class PaysharkOrder:
     external_id: Optional[str] = None
     raw: Optional[Dict[str, Any]] = None
 
+
 def build_external_id(chat_id: int, plan: str) -> str:
     # tg-<chat_id>-<plan>-<uuid>
     return f"tg-{chat_id}-{plan}-{uuid.uuid4().hex}"
+
 
 class PaysharkClient:
     def __init__(self) -> None:
@@ -29,7 +32,7 @@ class PaysharkClient:
             or os.getenv("PAYSHARK_API_TOKEN")
             or os.getenv("ACCESS_TOKEN")
             or ""
-        ).strip()
+        ).strip().strip('"').strip("'")
         self.merchant_id = (
             os.getenv("PAYSHARK_MERCHANT_ID")
             or os.getenv("PAYSHARK_MERCHANT")
@@ -47,13 +50,8 @@ class PaysharkClient:
         self._timeout = float(os.getenv("PAYSHARK_TIMEOUT_SEC", "20"))
 
     def _headers(self) -> Dict[str, str]:
-        # В доке: Access-Token. На всякий — шлём несколько вариантов.
-        return {
-            "Accept": "application/json",
-            "Access-Token": self.access_token,
-            "access-token": self.access_token,
-            "Authorization": f"Bearer {self.access_token}",
-        }
+        # Payshark просит access-token. Шлём ровно один заголовок (без дублей), чтобы исключить баги на стороне прокси.
+        return {"Accept": "application/json", "access-token": self.access_token}
 
     async def create_h2h_order(
         self,
@@ -62,7 +60,7 @@ class PaysharkClient:
         external_id: str,
         payment_gateway: Optional[str] = None,
         payment_detail_type: Optional[str] = None,
-currency: Optional[str] = None,
+        currency: Optional[str] = None,
         description: str = "",
     ) -> PaysharkOrder:
         """Host2Host (H2H): POST /api/h2h/order (по доке Payshark).
@@ -73,6 +71,7 @@ currency: Optional[str] = None,
         - amount (целое число)
         - payment_gateway (пример: sberbank)
         - payment_detail_type (пример: card)
+        Примечание: client_id / white_triangle — убраны (вы их не используете, и Payshark попросил не слать).
         """
 
         url = f"{self.base_url}/api/h2h/order"
@@ -157,6 +156,5 @@ currency: Optional[str] = None,
             payment_detail=payment_detail,
             link_page_url=str(link) if link else None,
             external_id=str(obj.get("external_id") or external_id),
-
             raw=obj,
         )
