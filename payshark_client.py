@@ -15,6 +15,7 @@ class PaysharkOrder:
     payment_detail: Optional[Any] = None
     link_page_url: Optional[str] = None
     external_id: Optional[str] = None
+    client_id: Optional[str] = None
     raw: Optional[Dict[str, Any]] = None
 
 
@@ -25,14 +26,18 @@ def build_external_id(chat_id: int, plan: str) -> str:
 
 class PaysharkClient:
     def __init__(self) -> None:
-        self.base_url = (os.getenv("PAYSHARK_BASE_URL") or "").rstrip("/")
+        # ВАЖНО: .strip() обязателен — иначе из Render/.env легко прилетает скрытый \r/пробел,
+        # и домен перестаёт резолвиться (ConnectError: Name or service not known).
+        self.base_url = (os.getenv("PAYSHARK_BASE_URL") or "").strip().rstrip("/")
+
         self.access_token = (
             os.getenv("PAYSHARK_ACCESS_TOKEN")
             or os.getenv("PAYSHARK_TOKEN")
             or os.getenv("PAYSHARK_API_TOKEN")
             or os.getenv("ACCESS_TOKEN")
             or ""
-        ).strip().strip('"').strip("'")
+        ).strip()
+
         self.merchant_id = (
             os.getenv("PAYSHARK_MERCHANT_ID")
             or os.getenv("PAYSHARK_MERCHANT")
@@ -50,56 +55,58 @@ class PaysharkClient:
         self._timeout = float(os.getenv("PAYSHARK_TIMEOUT_SEC", "20"))
 
     def _headers(self) -> Dict[str, str]:
-        # По доке Payshark ожидает заголовок Access-Token.
-        # Шлём ровно один заголовок (без дублей), чтобы исключить баги на стороне прокси.
-        return {"Accept": "application/json", "Access-Token": self.access_token}
+        # По рабочему примеру Payshark: нужен именно Access-Token (и без дублей/Authorization).
+        return {
+            "Accept": "application/json",
+            "Access-Token": self.access_token,
+        }
 
     async def create_h2h_order(
         self,
         *,
         amount: int,
         external_id: str,
+        client_id: Optional[str] = None,
         payment_gateway: Optional[str] = None,
         payment_detail_type: Optional[str] = None,
         currency: Optional[str] = None,
         description: str = "",
-        callback_url: Optional[str] = None,
     ) -> PaysharkOrder:
-        """Host2Host (H2H): POST /api/h2h/order (по доке Payshark).
+        """Host2Host (H2H): POST /api/h2h/order.
 
-        Док-минимум полей:
+        Минимум:
         - merchant_id
         - external_id
         - amount (целое число)
-        - payment_gateway (пример: sberbank)
         - payment_detail_type (пример: card)
-        Примечание: client_id / white_triangle — убраны (вы их не используете, и Payshark попросил не слать).
+
+        Выбор банка:
+        - Фиксированный банк: payment_gateway=sberbank (или другой)
+        - «Любой банк на выбор»: НЕ передавайте payment_gateway, но передайте currency=rub
         """
 
         url = f"{self.base_url}/api/h2h/order"
 
-        gateway = (payment_gateway or os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "sberbank").strip()
         detail_type = (payment_detail_type or os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card").strip()
 
         data: Dict[str, Any] = {
             "merchant_id": self.merchant_id,
             "external_id": str(external_id),
             "amount": int(amount),
-            "payment_gateway": gateway,
             "payment_detail_type": detail_type,
         }
 
-        # callback_url можно задать в настройках мерчанта, но для надёжности прокидываем, если передали.
-        if callback_url is not None:
-            cb = str(callback_url).strip()
-            if cb:
-                data["callback_url"] = cb
+        gw = (payment_gateway or "").strip()
+        if gw:
+            data["payment_gateway"] = gw
 
-        # currency в доке примера нет. Отправляем только если явно задано.
-        if currency is not None:
-            cur = str(currency).strip()
-            if cur:
-                data["currency"] = cur
+        cur = (currency or "").strip()
+        if cur:
+            data["currency"] = cur
+
+        cid = (client_id or "").strip()
+        if cid:
+            data["client_id"] = cid
 
         if description:
             data["description"] = str(description)
@@ -110,7 +117,6 @@ class PaysharkClient:
             if body_mode == "json":
                 r = await client.post(url, headers=self._headers(), json=data)
             else:
-                # как в примере curl: -d ... (application/x-www-form-urlencoded)
                 r = await client.post(url, headers=self._headers(), data=data)
 
         try:
@@ -121,8 +127,6 @@ class PaysharkClient:
         if r.status_code >= 400:
             raise RuntimeError(f"Payshark H2H HTTP {r.status_code}: {r.text[:1200]}")
 
-        # Важно: Payshark может вернуть HTTP 200, но success=false / errors=... —
-        # тогда сделка НЕ создана, и нужно показать понятную причину.
         if isinstance(payload, dict):
             if payload.get("success") is False:
                 msg = str(payload.get("message") or "Unknown error")
@@ -131,7 +135,6 @@ class PaysharkClient:
                     msg = f"{msg} | errors={errs}"
                 raise RuntimeError(f"Payshark H2H error: {msg}")
 
-            # Иногда приходит формат {message: ..., errors: {...}} без поля success
             if "errors" in payload and "message" in payload and "data" not in payload:
                 msg = str(payload.get("message") or "Validation error")
                 errs = payload.get("errors")
@@ -156,13 +159,17 @@ class PaysharkClient:
             or obj.get("details")
         )
 
+        external_id_out = obj.get("external_id") or external_id
+        client_id_out = obj.get("client_id") or (client_id or None)
+
         return PaysharkOrder(
             order_id=order_id,
             status=str(obj.get("status") or ""),
             amount=str(obj.get("amount") or amount),
-            currency=str(obj.get("currency") or (currency or "")),
+            currency=str(obj.get("currency") or cur or ""),
             payment_detail=payment_detail,
             link_page_url=str(link) if link else None,
-            external_id=str(obj.get("external_id") or external_id),
+            external_id=str(external_id_out) if external_id_out else None,
+            client_id=str(client_id_out) if client_id_out else None,
             raw=obj,
         )

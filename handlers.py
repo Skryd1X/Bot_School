@@ -1336,18 +1336,19 @@ async def cb_pay_plan(call: CallbackQuery):
 
     title = "LITE" if plan == "lite" else "PRO"
     try:
-        api = PaysharkClient()
-        order = await api.create_h2h_order(
-            amount=int(amount),
-            external_id=external_id,
-            callback_url=callback_url,
-            # По доке Payshark (пример): payment_gateway=sberbank, payment_detail_type=card
-            payment_gateway=(os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "sberbank"),
-            payment_detail_type=(os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card"),
-            # currency в примере доки нет — не шлём, чтобы не ловить 422 по разрешённым валютам
-            currency=None,
-            description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
-        )
+        
+api = PaysharkClient()
+order = await api.create_h2h_order(
+    amount=int(amount),
+    external_id=external_id,
+    # Для H2H нам достаточно external_id (там уже chat_id+plan). client_id не обязателен.
+    client_id=None,
+    # Вариант "любой банк на выбор": НЕ передаём payment_gateway, но передаём currency=rub
+    payment_gateway=None,
+    payment_detail_type=(os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card"),
+    currency=(os.getenv("PAYSHARK_CURRENCY") or "rub"),
+    description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
+)
     except Exception as e:
 
         import logging, re
@@ -1368,12 +1369,10 @@ async def cb_pay_plan(call: CallbackQuery):
                 log.exception('Payshark H2H error | chat_id=%s plan=%s ext=%s', chat_id, plan, external_id)
         except Exception:
             log.exception('Payshark H2H error (logging failed)')
-        # Покажем человеку понятную причину, если Payshark вернул её текстом.
+        # Покажем человеку понятную причину, если Payshark вернул её текстом (HTTP 200 + success=false).
         user_reason = None
         if msg.startswith("Payshark H2H error:"):
             user_reason = msg.replace("Payshark H2H error:", "").strip()
-        elif "Invalid Access Token" in msg:
-            user_reason = "Invalid Access Token (проверь PAYSHARK_ACCESS_TOKEN в Render / .env и что токен выдан именно для H2H)."
         elif "Подходящие платежные реквизиты" in msg:
             user_reason = "Подходящие платежные реквизиты не найдены (метод оплаты не настроен у мерчанта)."
 
