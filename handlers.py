@@ -1333,22 +1333,25 @@ async def cb_pay_plan(call: CallbackQuery):
 
     external_id = build_external_id(chat_id, plan)
     callback_url = f"{PUBLIC_BASE_URL}/payshark/webhook"
-
     title = "LITE" if plan == "lite" else "PRO"
     try:
-        
-api = PaysharkClient()
-order = await api.create_h2h_order(
-    amount=int(amount),
-    external_id=external_id,
-    # Для H2H нам достаточно external_id (там уже chat_id+plan). client_id не обязателен.
-    client_id=None,
-    # Вариант "любой банк на выбор": НЕ передаём payment_gateway, но передаём currency=rub
-    payment_gateway=None,
-    payment_detail_type=(os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card"),
-    currency=(os.getenv("PAYSHARK_CURRENCY") or "rub"),
-    description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
-)
+        api = PaysharkClient()
+
+        payment_detail_type = (os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card").strip()
+
+        # Режим «любой банк»: НЕ передаём payment_gateway, а передаём currency=rub.
+        # Если задашь PAYSHARK_PAYMENT_GATEWAY в .env/Render env — будет фиксированный шлюз.
+        payment_gateway = (os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "").strip() or None
+        currency = (os.getenv("PAYSHARK_H2H_CURRENCY") or "rub").strip().lower()
+
+        order = await api.create_h2h_order(
+            amount=int(amount),
+            external_id=external_id,
+            payment_gateway=payment_gateway,
+            payment_detail_type=payment_detail_type,
+            currency=(None if payment_gateway else currency),
+            description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
+        )
     except Exception as e:
 
         import logging, re
