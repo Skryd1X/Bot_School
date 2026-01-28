@@ -5,7 +5,6 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-
 @dataclass
 class PaysharkOrder:
     order_id: str
@@ -15,14 +14,11 @@ class PaysharkOrder:
     payment_detail: Optional[Any] = None
     link_page_url: Optional[str] = None
     external_id: Optional[str] = None
-    client_id: Optional[str] = None
     raw: Optional[Dict[str, Any]] = None
-
 
 def build_external_id(chat_id: int, plan: str) -> str:
     # tg-<chat_id>-<plan>-<uuid>
     return f"tg-{chat_id}-{plan}-{uuid.uuid4().hex}"
-
 
 class PaysharkClient:
     def __init__(self) -> None:
@@ -64,11 +60,9 @@ class PaysharkClient:
         *,
         amount: int,
         external_id: str,
-        client_id: str,
         payment_gateway: Optional[str] = None,
         payment_detail_type: Optional[str] = None,
-        white_triangle: Optional[bool] = None,
-        currency: Optional[str] = None,
+currency: Optional[str] = None,
         description: str = "",
     ) -> PaysharkOrder:
         """Host2Host (H2H): POST /api/h2h/order (по доке Payshark).
@@ -79,8 +73,6 @@ class PaysharkClient:
         - amount (целое число)
         - payment_gateway (пример: sberbank)
         - payment_detail_type (пример: card)
-        - white_triangle=true|false (опционально)
-        - client_id (опционально)
         """
 
         url = f"{self.base_url}/api/h2h/order"
@@ -88,18 +80,12 @@ class PaysharkClient:
         gateway = (payment_gateway or os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "sberbank").strip()
         detail_type = (payment_detail_type or os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card").strip()
 
-        if white_triangle is None:
-            wt_env = (os.getenv("PAYSHARK_WHITE_TRIANGLE") or "true").strip().lower()
-            white_triangle = wt_env in {"1", "true", "yes", "y"}
-
         data: Dict[str, Any] = {
             "merchant_id": self.merchant_id,
             "external_id": str(external_id),
             "amount": int(amount),
             "payment_gateway": gateway,
             "payment_detail_type": detail_type,
-            "white_triangle": "true" if white_triangle else "false",
-            "client_id": str(client_id),
         }
 
         # currency в доке примера нет. Отправляем только если явно задано.
@@ -171,6 +157,6 @@ class PaysharkClient:
             payment_detail=payment_detail,
             link_page_url=str(link) if link else None,
             external_id=str(obj.get("external_id") or external_id),
-            client_id=str(obj.get("client_id") or client_id),
+
             raw=obj,
         )

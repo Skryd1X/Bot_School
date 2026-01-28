@@ -1336,15 +1336,13 @@ async def cb_pay_plan(call: CallbackQuery):
 
     title = "LITE" if plan == "lite" else "PRO"
     try:
-        client = PaysharkClient()
-        order = await client.create_h2h_order(
+        api = PaysharkClient()
+        order = await api.create_h2h_order(
             amount=int(amount),
             external_id=external_id,
-            client_id=str(chat_id),
             # По доке Payshark (пример): payment_gateway=sberbank, payment_detail_type=card
             payment_gateway=(os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "sberbank"),
             payment_detail_type=(os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card"),
-            white_triangle=((os.getenv("PAYSHARK_WHITE_TRIANGLE") or "true").strip().lower() in {"1","true","yes","y"}),
             # currency в примере доки нет — не шлём, чтобы не ловить 422 по разрешённым валютам
             currency=None,
             description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
