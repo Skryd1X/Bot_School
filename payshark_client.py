@@ -19,52 +19,49 @@ class PaysharkOrder:
 
 
 def build_external_id(chat_id: int, plan: str) -> str:
-    """external_id должен быть уникальным. Кодируем chat_id+plan для удобного трекинга."""
+    # tg-<chat_id>-<plan>-<uuid>
     return f"tg-{chat_id}-{plan}-{uuid.uuid4().hex}"
 
 
-def _sanitize_base_url(raw: str) -> str:
-    s = (raw or "").strip()
-    # Частая ошибка: в переменной окружения сохраняют значение в кавычках.
-    if (len(s) >= 2) and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
-        s = s[1:-1].strip()
-    s = s.rstrip("/")
-    if s and not s.startswith(("http://", "https://")):
-        s = "https://" + s
-    return s
+def _clean_base_url(value: str) -> str:
+    v = (value or "").strip()
+    # Remove accidental quotes from env values
+    if (len(v) >= 2) and ((v[0] == v[-1]) and v[0] in {"'", '"'}):
+        v = v[1:-1].strip()
+    return v.rstrip("/")
 
 
 class PaysharkClient:
-    """Мини‑клиент под Payshark H2H.
+    def __init__(self) -> None:
+        self.base_url = _clean_base_url(os.getenv("PAYSHARK_BASE_URL") or "https://app.payshark.io")
+        self.access_token = (
+            os.getenv("PAYSHARK_ACCESS_TOKEN")
+            or os.getenv("PAYSHARK_TOKEN")
+            or os.getenv("PAYSHARK_API_TOKEN")
+            or os.getenv("ACCESS_TOKEN")
+            or ""
+        ).strip()
+        self.merchant_id = (
+            os.getenv("PAYSHARK_MERCHANT_ID")
+            or os.getenv("PAYSHARK_MERCHANT")
+            or os.getenv("MERCHANT_ID")
+            or ""
+        ).strip()
 
-    Важно:
-    - Для H2H /api/h2h/order используется заголовок Access-Token.
-    - Тело — form-data/x-www-form-urlencoded (как в curl примере).
-    - Для режима "любой банк" НЕ отправляем payment_gateway, а отправляем currency=rub.
-    """
-
-    def __init__(self):
-        self.base_url = _sanitize_base_url(os.getenv("PAYSHARK_BASE_URL") or "https://app.payshark.io")
-
-        self.api_key = (os.getenv("PAYSHARK_API_KEY") or os.getenv("PAYSHARK_ACCESS_TOKEN") or os.getenv("PAYSHARK_TOKEN") or "").strip()
-        if (len(self.api_key) >= 2) and ((self.api_key[0] == '"' and self.api_key[-1] == '"') or (self.api_key[0] == "'" and self.api_key[-1] == "'")):
-            self.api_key = self.api_key[1:-1].strip()
-
-        self.merchant_id = (os.getenv("PAYSHARK_MERCHANT_ID") or "").strip()
-        if (len(self.merchant_id) >= 2) and ((self.merchant_id[0] == '"' and self.merchant_id[-1] == '"') or (self.merchant_id[0] == "'" and self.merchant_id[-1] == "'")):
-            self.merchant_id = self.merchant_id[1:-1].strip()
-
-        self.timeout = float(os.getenv("PAYSHARK_TIMEOUT", "30"))
-
-        if not self.api_key:
-            raise RuntimeError("PAYSHARK_API_KEY is not set")
+        if not self.base_url:
+            raise RuntimeError("PAYSHARK_BASE_URL is not set")
+        if not self.access_token:
+            raise RuntimeError("PAYSHARK_ACCESS_TOKEN is not set")
         if not self.merchant_id:
             raise RuntimeError("PAYSHARK_MERCHANT_ID is not set")
 
+        self._timeout = float(os.getenv("PAYSHARK_TIMEOUT_SEC", "25"))
+
     def _headers(self) -> Dict[str, str]:
+        # В рабочем примере Payshark: только Access-Token
         return {
             "Accept": "application/json",
-            "Access-Token": self.api_key,
+            "Access-Token": self.access_token,
         }
 
     async def create_h2h_order(
@@ -72,67 +69,86 @@ class PaysharkClient:
         *,
         amount: int,
         external_id: str,
-        payment_detail_type: Optional[str] = None,
-        payment_gateway: Optional[str] = None,
+        payment_detail_type: str = "card",
+        # Для режима "любой банк" gateway НЕ передаём, а указываем currency=rub
         currency: Optional[str] = None,
-        description: Optional[str] = None,
+        payment_gateway: Optional[str] = None,
+        description: str = "",
     ) -> PaysharkOrder:
+        """Host2Host (H2H): POST /api/h2h/order (как в примере curl Payshark).
+
+        Минимум полей:
+        - merchant_id
+        - external_id
+        - amount
+        - payment_detail_type
+        Дополнительно:
+        - payment_gateway (если хотите конкретный банк)
+        - currency (если хотите "любой банк", например rub)
+        """
+
         url = f"{self.base_url}/api/h2h/order"
 
-        mode = (os.getenv("PAYSHARK_H2H_MODE") or "anybank").strip().lower()  # anybank | gateway
-        detail_type = (payment_detail_type or os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card").strip().lower()
-        gateway_default = (os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "sberbank").strip()
-        currency_default = (os.getenv("PAYSHARK_CURRENCY") or "rub").strip().lower()
-
-        data: Dict[str, str] = {
+        data: Dict[str, Any] = {
             "merchant_id": self.merchant_id,
             "external_id": str(external_id),
-            "amount": str(int(amount)),
-            "payment_detail_type": detail_type,
+            "amount": int(amount),
+            "payment_detail_type": (payment_detail_type or "card").strip(),
         }
+
+        gw = (payment_gateway or "").strip()
+        if gw:
+            data["payment_gateway"] = gw
+
+        cur = (currency or "").strip()
+        if cur:
+            data["currency"] = cur
+
         if description:
             data["description"] = str(description)
 
-        if mode == "anybank":
-            # В режиме "любой банк" payment_gateway НЕ передаём.
-            data["currency"] = (currency or currency_default or "rub").strip().lower()
-        else:
-            gw = (payment_gateway or gateway_default).strip() if (payment_gateway or gateway_default) else ""
-            if gw:
-                data["payment_gateway"] = gw
-            if currency:
-                data["currency"] = str(currency).strip().lower()
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            # как в примере curl: -d ... (application/x-www-form-urlencoded)
             r = await client.post(url, headers=self._headers(), data=data)
 
+        # Payshark часто возвращает JSON даже на ошибке
+        try:
+            payload = r.json()
+        except Exception:
+            payload = None
+
         if r.status_code >= 400:
+            # Сохраняем оригинальный текст (там message на русском)
             raise RuntimeError(f"Payshark H2H HTTP {r.status_code}: {r.text[:1200]}")
 
-        payload: Dict[str, Any] = r.json() if r.content else {}
-        if not payload.get("success", False):
-            message = payload.get("message") or "Unknown error"
-            raise RuntimeError(f"Payshark H2H error: {message}")
+        if isinstance(payload, dict) and payload.get("success") is False:
+            msg = str(payload.get("message") or "Unknown error")
+            raise RuntimeError(f"Payshark H2H error: {msg}")
 
-        d = payload.get("data") or {}
-        order_id = str(d.get("id") or d.get("order_id") or "")
-        status = str(d.get("status") or "created")
-        amount_s = str(d.get("amount") or amount)
-        currency_s = str(d.get("currency") or data.get("currency") or "rub")
+        obj = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+        if not isinstance(obj, dict):
+            raise RuntimeError(f"Unexpected Payshark H2H response: {r.text[:1200]}")
 
-        payment_detail = d.get("payment_detail")
-        if payment_detail is None:
-            payment_detail = d.get("payment_detail_data") or d.get("requisites") or d.get("details")
+        order_id = str(obj.get("order_id") or obj.get("id") or "")
+        if not order_id:
+            raise RuntimeError(f"Payshark H2H response missing order_id: {r.text[:1200]}")
 
-        link_page_url = d.get("link_page_url") or d.get("payment_url") or d.get("link")
+        link = obj.get("link_page_url") or obj.get("payment_link") or obj.get("url")
+        payment_detail = (
+            obj.get("payment_detail")
+            or obj.get("paymentDetails")
+            or obj.get("requisites")
+            or obj.get("requisite")
+            or obj.get("details")
+        )
 
         return PaysharkOrder(
             order_id=order_id,
-            status=status,
-            amount=amount_s,
-            currency=currency_s,
+            status=str(obj.get("status") or ""),
+            amount=str(obj.get("amount") or amount),
+            currency=str(obj.get("currency") or (currency or "")),
             payment_detail=payment_detail,
-            link_page_url=link_page_url,
-            external_id=str(d.get("external_id") or external_id),
-            raw=payload,
+            link_page_url=str(link) if link else None,
+            external_id=str(obj.get("external_id") or external_id),
+            raw=obj,
         )
