@@ -47,6 +47,17 @@ from tts import tts_voice_ogg, split_for_tts
 
 router = Router()
 
+# Anti-spam: блокируем параллельное создание оплаты по одному chat_id
+_PAY_LOCKS: Dict[int, asyncio.Lock] = {}
+
+def _get_pay_lock(chat_id: int) -> asyncio.Lock:
+    lock = _PAY_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PAY_LOCKS[chat_id] = lock
+    return lock
+
+
 COOLDOWN_SECONDS = 5
 MIN_INTERVAL_SEND = 1.1
 MIN_EDIT_INTERVAL = 0.25
@@ -179,7 +190,7 @@ def build_greeting(lang: str, is_free: bool, mode_title: str) -> str:
             "— 🎁 Friends bonus: invite friends and get PRO.\n\n"
             f"Current bot mode: {mode_title}\n"
             "You can change it in ⚙️ Settings → 🎛 Bot mode."
-        )
+                )
     # default Russian
     return (
         "👋 Привет! Я — учебный помощник для школы и вузов.\n\n"
@@ -587,7 +598,7 @@ async def safe_edit(message: Message, message_id: int, text: str, reply_markup: 
             message_id=message_id,
             text=text,
             reply_markup=reply_markup
-        )
+                )
     except TelegramBadRequest as e:
         low = str(e).lower()
         if "message is not modified" in low:
@@ -600,7 +611,7 @@ async def safe_edit(message: Message, message_id: int, text: str, reply_markup: 
                     message_id=message_id,
                     text=text,
                     reply_markup=reply_markup
-                )
+                        )
             except Exception:
                 pass
 
@@ -621,7 +632,7 @@ async def show_cooldown_counter(message: Message, seconds_left: int):
                     chat_id=message.chat.id,
                     message_id=counter.message_id,
                     text=f"🕒 Медленный режим: {seconds_left} сек"
-                )
+                        )
             except TelegramBadRequest as e:
                 if "message is not modified" in str(e).lower():
                     continue
@@ -638,7 +649,7 @@ async def send_long_text(message: Message, text: str):
         await message.answer(
             text[i:i + MAX_TG_LEN],
             reply_markup=main_kb_for_plan(await _is_free(message.chat.id)) if i + MAX_TG_LEN >= len(text) else None
-        )
+                )
 
 async def show_subscriptions(message: Message):
     text = await get_status_text(message.chat.id)
@@ -676,7 +687,7 @@ async def cmd_start(message: Message):
             "🌐 Выберите язык бота (интерфейс + ответы).\n"
             "Choose the bot language (interface + answers).",
             reply_markup=LANG_SELECT_KB,
-        )
+                )
         return
 
     # авто-озвучка для PRO по умолчанию (если включено в конфиге)
@@ -1134,7 +1145,7 @@ async def secret_code_grant(message: Message):
         return await message.answer(
             "Нельзя добавить нового админа — достигнут лимит (2 админа).",
             reply_markup=main_kb_for_plan(await _is_free(message.chat.id)),
-        )
+                )
     ADMINS.add(uid)
     _save_admins()
     await message.answer("✅ Вы добавлены как админ. Открываю админ-панель.", reply_markup=ADMIN_KB)
@@ -1269,7 +1280,7 @@ async def _deliver_to_all(bot, send_corofn, progress_msg: Message):
                     chat_id=progress_msg.chat.id,
                     message_id=progress_msg.message_id,
                     text=f"Рассылка… {ok}/{total} {_progress_bar(pct)}"
-                )
+                        )
             except Exception:
                 pass
             await asyncio.sleep(BROADCAST_DELAY_SEC)
@@ -1280,7 +1291,7 @@ async def _deliver_to_all(bot, send_corofn, progress_msg: Message):
             chat_id=progress_msg.chat.id,
             message_id=progress_msg.message_id,
             text=f"Готово ✅ Отправлено: {ok}/{total}"
-        )
+                )
     except Exception:
         pass
 
@@ -1318,6 +1329,16 @@ async def cb_show_plans(call: CallbackQuery):
 @router.callback_query(F.data.in_(("pay_lite", "pay_pro")))
 async def cb_pay_plan(call: CallbackQuery):
     chat_id = call.message.chat.id
+    # Быстро отвечаем на callback, чтобы Telegram не ретраил запрос
+    try:
+        await call.answer("Создаю реквизиты…", show_alert=False)
+    except Exception:
+        pass
+
+    lock = _get_pay_lock(chat_id)
+    if lock.locked():
+        return
+
     username = (call.from_user.username or "").strip() if call.from_user else ""
     plan = "lite" if call.data == "pay_lite" else "pro"
     price_str = LITE_PRICE if plan == "lite" else PRO_PRICE
@@ -1327,31 +1348,29 @@ async def cb_pay_plan(call: CallbackQuery):
         await call.message.answer(
             "⚠️ Оплата временно недоступна (не настроен PUBLIC_BASE_URL).\n"
             f"Напишите в поддержку: {SUPPORT_CONTACT}"
-        )
+                )
         await call.answer()
         return
 
     external_id = build_external_id(chat_id, plan)
     callback_url = f"{PUBLIC_BASE_URL}/payshark/webhook"
+
     title = "LITE" if plan == "lite" else "PRO"
     try:
-        api = PaysharkClient()
+        # Anybank: банк не указываем, обязательно передаём валюту
+        currency = (os.getenv("PAYSHARK_CURRENCY") or PAYSHARK_CURRENCY or "rub").strip().lower()
+        payment_detail_type = (os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or PAYSHARK_PAYMENT_DETAIL_TYPE or "card").strip().lower()
 
-        payment_detail_type = (os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card").strip()
-
-        # Режим «любой банк»: НЕ передаём payment_gateway, а передаём currency=rub.
-        # Если задашь PAYSHARK_PAYMENT_GATEWAY в .env/Render env — будет фиксированный шлюз.
-        payment_gateway = (os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "").strip() or None
-        currency = (os.getenv("PAYSHARK_H2H_CURRENCY") or "rub").strip().lower()
-
-        order = await api.create_h2h_order(
-            amount=int(amount),
-            external_id=external_id,
-            payment_gateway=payment_gateway,
-            payment_detail_type=payment_detail_type,
-            currency=(None if payment_gateway else currency),
-            description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
-        )
+        async with lock:
+            client = PaysharkClient()
+            order = await client.create_h2h_order(
+                amount=int(amount),
+                external_id=external_id,
+                payment_gateway=None,
+                currency=currency,
+                payment_detail_type=payment_detail_type,
+                description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
+            )
     except Exception as e:
 
         import logging, re
@@ -1374,6 +1393,16 @@ async def cb_pay_plan(call: CallbackQuery):
             log.exception('Payshark H2H error (logging failed)')
         # Покажем человеку понятную причину, если Payshark вернул её текстом (HTTP 200 + success=false).
         user_reason = None
+        try:
+            import httpx
+            if isinstance(e, httpx.ConnectError) or 'Name or service not known' in msg:
+                code = 'H2H_DNS'
+                user_reason = (
+                    'Не удалось подключиться к PayShark (DNS/host). '
+                    'Проверь PAYSHARK_BASE_URL в Render: должно быть https://app.payshark.io без кавычек.'
+                )
+        except Exception:
+            pass
         if msg.startswith("Payshark H2H error:"):
             user_reason = msg.replace("Payshark H2H error:", "").strip()
         elif "Подходящие платежные реквизиты" in msg:
@@ -1385,13 +1414,13 @@ async def cb_pay_plan(call: CallbackQuery):
                 f"Причина: {user_reason}\n"
                 f"Код: {code}\n"
                 f"Поддержка: {SUPPORT_CONTACT}"
-            )
+                    )
         else:
             await call.message.answer(
                 "💳 Оплата временно недоступна.\n"
                 f"Код: {code}\n"
                 f"Поддержка: {SUPPORT_CONTACT}"
-            )
+                    )
         await call.answer()
         return
 
@@ -1405,13 +1434,13 @@ async def cb_pay_plan(call: CallbackQuery):
             currency=str(order.currency or PAYSHARK_CURRENCY or "RUB"),
             provider="payshark",
             raw_create=order.raw,
-        )
+                )
         await payment_set_status(
             str(order.order_id),
             status=str(order.status or "created"),
             raw_event=None,
             external_id=str(order.external_id or external_id),
-        )
+                )
     except Exception:
         # если БД недоступна, всё равно покажем пользователю реквизиты
         pass
@@ -1518,7 +1547,7 @@ async def generate_answer(message: Message, state: FSMContext):
             "Объясни как опытный учитель: короткое введение, пошаговое решение, "
             "где часто ошибаются, мини-проверка на 2–3 вопроса в конце.\n\nВопрос: "
             + user_text
-        )
+                )
     user_text = await apply_mode_to_text(chat_id, user_text)
     await state.set_state("generating")
     await message.bot.send_chat_action(chat_id, ChatAction.TYPING)
@@ -1608,7 +1637,7 @@ async def on_photo(message: Message, state: FSMContext):
             image_bytes,
             hint=hint_text,
             history=await get_history(chat_id)
-        )
+                )
         is_pro = await _is_pro(chat_id)
         final_text = f"⚡ PRO-приоритет\n{answer}" if (is_pro and answer) else (answer or "Не удалось распознать задачу.")
         if len(final_text) > MAX_TG_LEN:
@@ -1620,7 +1649,7 @@ async def on_photo(message: Message, state: FSMContext):
             await safe_edit(
                 message, draft.message_id, final_text,
                 reply_markup=answer_actions_kb(is_pro and bool(answer))
-            )
+                    )
         await add_history(chat_id, "user", "[Фото задачи]")
         await add_history(chat_id, "assistant", answer or "")
         await inc_usage(chat_id, "photo")
@@ -1694,8 +1723,8 @@ def _quiz_kb(qi: dict, q_index: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text=f"{chr(65 + i)}) {opt}",
                 callback_data=f"quiz_answer:{q_index}:{i}"
-            )
-        )
+                    )
+                )
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1747,7 +1776,7 @@ async def cb_quiz_answer(call: CallbackQuery):
             await call.message.answer(
                 f"Вопрос {next_idx + 1}/{len(items)}:\n{qn.get('q', '')}",
                 reply_markup=_quiz_kb(qn, next_idx)
-            )
+                    )
         else:
             QUIZ_STATE.pop(chat_id, None)
             await call.message.answer("Готово! Хочешь ещё раз — жми «🧠 Проверить себя».")
