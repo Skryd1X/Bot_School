@@ -1340,6 +1340,7 @@ async def cb_pay_plan(call: CallbackQuery):
         order = await api.create_h2h_order(
             amount=int(amount),
             external_id=external_id,
+            callback_url=callback_url,
             # По доке Payshark (пример): payment_gateway=sberbank, payment_detail_type=card
             payment_gateway=(os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "sberbank"),
             payment_detail_type=(os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card"),

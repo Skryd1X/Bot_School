@@ -50,8 +50,9 @@ class PaysharkClient:
         self._timeout = float(os.getenv("PAYSHARK_TIMEOUT_SEC", "20"))
 
     def _headers(self) -> Dict[str, str]:
-        # Payshark просит access-token. Шлём ровно один заголовок (без дублей), чтобы исключить баги на стороне прокси.
-        return {"Accept": "application/json", "access-token": self.access_token}
+        # По доке Payshark ожидает заголовок Access-Token.
+        # Шлём ровно один заголовок (без дублей), чтобы исключить баги на стороне прокси.
+        return {"Accept": "application/json", "Access-Token": self.access_token}
 
     async def create_h2h_order(
         self,
@@ -62,6 +63,7 @@ class PaysharkClient:
         payment_detail_type: Optional[str] = None,
         currency: Optional[str] = None,
         description: str = "",
+        callback_url: Optional[str] = None,
     ) -> PaysharkOrder:
         """Host2Host (H2H): POST /api/h2h/order (по доке Payshark).
 
@@ -86,6 +88,12 @@ class PaysharkClient:
             "payment_gateway": gateway,
             "payment_detail_type": detail_type,
         }
+
+        # callback_url можно задать в настройках мерчанта, но для надёжности прокидываем, если передали.
+        if callback_url is not None:
+            cb = str(callback_url).strip()
+            if cb:
+                data["callback_url"] = cb
 
         # currency в доке примера нет. Отправляем только если явно задано.
         if currency is not None:
