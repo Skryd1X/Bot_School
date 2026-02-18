@@ -58,7 +58,7 @@ PAYSHARK_LITE_URL = os.getenv("PAYSHARK_LITE_URL", "").strip()
 PAYSHARK_PRO_URL = os.getenv("PAYSHARK_PRO_URL", "").strip()
 PAYSHARK_CURRENCY = (os.getenv("PAYSHARK_CURRENCY") or "RUB").strip() or "RUB"
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
-SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@gptEDU_support").strip() or "@gptEDU_support"
+SUPPORT_CONTACT = (os.getenv("SUPPORT_CONTACT") or "@criptos_support\n@Skryd1X").strip()
 PROMO_CODE = os.getenv("PROMO_CODE", "uStudyPromoTest").strip()
 PROMO_PRO_DAYS = int(os.getenv("PROMO_PRO_DAYS", "365"))
 
@@ -67,6 +67,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot").lstrip("@")
 REF_BONUS_THRESHOLD = int(os.getenv("REF_BONUS_THRESHOLD", "6"))
 
 TTS_ENABLED_DEFAULT_PRO = False
+TTS_CHUNK_LIMIT = 2500
 TTS_CHUNK_LIMIT = 2500
 
 # ----------------- ЯЗЫК / I18N -----------------
@@ -891,7 +892,10 @@ FAQ_KB = ReplyKeyboardMarkup(
 
 @router.message(F.text == "FAQ / Помощь")
 async def faq_main(message: Message):
-    await message.answer("Выберите раздел:", reply_markup=FAQ_KB)
+    await message.answer(
+        f"Выберите раздел:\n\n🆘 Поддержка:\n{SUPPORT_CONTACT}",
+        reply_markup=FAQ_KB
+    )
 
 @router.message(F.text == "Как пользоваться ботом")
 async def faq_how(message: Message):
@@ -963,7 +967,7 @@ async def faq_offer(message: Message):
         "7. Заключительные положения\n"
         "7.1. Настоящее Соглашение вступает в силу с момента начала использования Бота.\n"
         "7.2. Все возникающие вопросы, не урегулированные Соглашением, решаются в соответствии с действующим законодательством.\n"
-        "7.3. Контакт для обращений: @gptEDU_support"
+        "7.3. Контакты для обращений: @criptos_support, @Skryd1X"
     )
     if len(offer_text) > MAX_TG_LEN:
         await send_long_text(message, offer_text)
@@ -1756,6 +1760,7 @@ async def cb_quiz_answer(call: CallbackQuery):
     except Exception:
         await call.answer("Ошибка обработки ответа.", show_alert=True)
 
+@router.callback_query(F.data.in_(("need_pro_pdf", "need_pro_quiz")))
 @router.callback_query(F.data.in_(("need_pro_pdf", "need_pro_quiz")))
 async def cb_need_pro(call: CallbackQuery):
     await call.answer("Функция доступна только в PRO.", show_alert=True)
