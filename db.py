@@ -32,8 +32,24 @@ LITE_PHOTO_LIMIT = int(os.getenv("LITE_PHOTO_LIMIT", "120"))
 
 UNLIMITED = 10**12
 
-PAYSHARK_LITE_PRICE = os.getenv("PAYSHARK_LITE_PRICE") or os.getenv("LITE_PRICE_RUB") or os.getenv("TRIBUTE_LITE_PRICE") or "199.99"
-PAYSHARK_PRO_PRICE = os.getenv("PAYSHARK_PRO_PRICE") or os.getenv("PRO_PRICE_RUB") or os.getenv("TRIBUTE_PRO_PRICE") or "299.99"
+# Универсальные цены (под WATA/любой провайдер)
+LITE_PRICE = (
+    os.getenv("WATA_LITE_PRICE")
+    or os.getenv("PAYSHARK_LITE_PRICE")
+    or os.getenv("LITE_PRICE_RUB")
+    or os.getenv("LITE_PRICE")
+    or os.getenv("TRIBUTE_LITE_PRICE")
+    or "199.99"
+)
+PRO_PRICE = (
+    os.getenv("WATA_PRO_PRICE")
+    or os.getenv("PAYSHARK_PRO_PRICE")
+    or os.getenv("PRO_PRICE_RUB")
+    or os.getenv("PRO_PRICE")
+    or os.getenv("TRIBUTE_PRO_PRICE")
+    or "299.99"
+)
+
 SUBSCRIPTION_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
 
 
@@ -72,7 +88,8 @@ _DEFAULT_PREFS: Dict[str, Any] = {
     "teacher_mode": False,
     "answer_style": "generic",
     "priority": False,
-    "lang": "auto",
+    # ВАЖНО: чтобы твой handlers не путался, ставим ru по умолчанию
+    "lang": "ru",
     "communication_mode": "normal",
     "task_mode": "auto",
     "materials_mode": "auto",
@@ -101,7 +118,9 @@ def _as_price(value: str) -> str:
     s = (value or "").strip().replace(",", ".")
     try:
         v = float(s)
-        return f"{v:.2f}".rstrip("0").rstrip(".") if "." in f"{v:.2f}" else f"{v:.2f}"
+        x = f"{v:.2f}"
+        x = x.rstrip("0").rstrip(".")
+        return x or "0"
     except Exception:
         return s or "0"
 
@@ -113,15 +132,18 @@ async def ensure_user(chat_id: int) -> dict:
         if "optin" not in doc:
             await users.update_one({"chat_id": chat_id}, {"$set": {"optin": True}})
             doc["optin"] = True
+
         merged = _merge_defaults(doc.get("prefs") if isinstance(doc.get("prefs"), dict) else {})
         if doc.get("prefs") != merged:
             await users.update_one({"chat_id": chat_id}, {"$set": {"prefs": merged}})
             doc["prefs"] = merged
+
         raw_exp = doc.get("sub_expires_at")
         norm_exp = _to_aware_utc(raw_exp)
         if norm_exp != raw_exp:
             await users.update_one({"chat_id": chat_id}, {"$set": {"sub_expires_at": norm_exp}})
             doc["sub_expires_at"] = norm_exp
+
         month = _month_key(now)
         if doc.get("period_month") != month:
             await users.update_one(
@@ -131,6 +153,7 @@ async def ensure_user(chat_id: int) -> dict:
             doc["period_month"] = month
             doc["text_used"] = 0
             doc["photo_used"] = 0
+
         return doc
 
     doc = {
@@ -166,14 +189,17 @@ async def get_limits(doc: dict) -> Tuple[int, int]:
     return (FREE_TEXT_LIMIT, FREE_PHOTO_LIMIT)
 
 
-async def can_use(doc: dict, kind: Literal["text", "photo"]) -> Tuple[bool, str]:
+# ✅ ВАЖНО: теперь can_use принимает chat_id (чтобы совпадать с handlers)
+async def can_use(chat_id: int, kind: Literal["text", "photo"]) -> Tuple[bool, str]:
+    doc = await ensure_user(chat_id)
+
     text_limit, photo_limit = await get_limits(doc)
-    tu, pu = doc.get("text_used", 0), doc.get("photo_used", 0)
+    tu, pu = int(doc.get("text_used", 0)), int(doc.get("photo_used", 0))
     plan = doc.get("plan", "free")
     active = await _is_subscription_active(doc)
 
-    lite_price = _as_price(PAYSHARK_LITE_PRICE)
-    pro_price = _as_price(PAYSHARK_PRO_PRICE)
+    lite_price = _as_price(LITE_PRICE)
+    pro_price = _as_price(PRO_PRICE)
 
     def _msg_free() -> str:
         return (
@@ -283,7 +309,7 @@ async def get_status_text(chat_id: int) -> str:
     doc = await ensure_user(chat_id)
     text_limit, photo_limit = await get_limits(doc)
     active = await _is_subscription_active(doc)
-    tu, pu = doc.get("text_used", 0), doc.get("photo_used", 0)
+    tu, pu = int(doc.get("text_used", 0)), int(doc.get("photo_used", 0))
     plan = doc.get("plan", "free")
     exp = _to_aware_utc(doc.get("sub_expires_at"))
 
@@ -407,60 +433,6 @@ async def set_priority(chat_id: int, on: bool) -> None:
     await users.update_one({"chat_id": chat_id}, {"$set": {"prefs.priority": bool(on)}}, upsert=True)
 
 
-async def get_lang(chat_id: int) -> str:
-    prefs = await get_prefs(chat_id)
-    return str(prefs.get("lang", "auto"))
-
-
-async def set_lang(chat_id: int, lang: str) -> None:
-    await users.update_one(
-        {"chat_id": chat_id},
-        {"$set": {"prefs.lang": str(lang)}},
-        upsert=True,
-    )
-
-
-async def get_modes(chat_id: int) -> Dict[str, Any]:
-    prefs = await get_prefs(chat_id)
-    return {
-        "communication_mode": prefs.get("communication_mode", _DEFAULT_PREFS["communication_mode"]),
-        "task_mode": prefs.get("task_mode", _DEFAULT_PREFS["task_mode"]),
-        "materials_mode": prefs.get("materials_mode", _DEFAULT_PREFS["materials_mode"]),
-        "study_mode": prefs.get("study_mode", _DEFAULT_PREFS["study_mode"]),
-        "coding_mode": prefs.get("coding_mode", _DEFAULT_PREFS["coding_mode"]),
-    }
-
-
-async def set_mode(chat_id: int, kind: str, value: str) -> None:
-    if kind not in {"communication_mode", "task_mode", "materials_mode", "study_mode", "coding_mode"}:
-        return
-    await users.update_one(
-        {"chat_id": chat_id},
-        {"$set": {f"prefs.{kind}": str(value)}},
-        upsert=True,
-    )
-
-
-async def set_communication_mode(chat_id: int, value: str) -> None:
-    await set_mode(chat_id, "communication_mode", value)
-
-
-async def set_task_mode(chat_id: int, value: str) -> None:
-    await set_mode(chat_id, "task_mode", value)
-
-
-async def set_materials_mode(chat_id: int, value: str) -> None:
-    await set_mode(chat_id, "materials_mode", value)
-
-
-async def set_study_mode(chat_id: int, value: str) -> None:
-    await set_mode(chat_id, "study_mode", value)
-
-
-async def set_coding_mode(chat_id: int, value: str) -> None:
-    await set_mode(chat_id, "coding_mode", value)
-
-
 async def add_history(
     chat_id: int,
     role: Literal["user", "assistant"],
@@ -524,7 +496,7 @@ async def payment_create(
     plan: str,
     amount: float,
     currency: str = "RUB",
-    provider: str = "payshark",
+    provider: str = "wata",
     raw_create: Optional[Dict[str, Any]] = None,
 ) -> bool:
     now = _now_utc()
@@ -669,9 +641,7 @@ async def mark_referral_paid_if_first(buyer_id: int) -> tuple[bool, int, Optiona
         {"$addToSet": {"referred_paid_ids": buyer_id}},
     )
     if getattr(res, "modified_count", 0) != 1:
-        doc = await users.find_one(
-            {"chat_id": referrer_id}, {"referred_paid_ids": 1}
-        )
+        doc = await users.find_one({"chat_id": referrer_id}, {"referred_paid_ids": 1})
         count = len(doc.get("referred_paid_ids") or [])
         return False, count, referrer_id
 
@@ -680,16 +650,12 @@ async def mark_referral_paid_if_first(buyer_id: int) -> tuple[bool, int, Optiona
         {"$inc": {"referred_paid_count": 1}},
         upsert=True,
     )
-    doc = await users.find_one(
-        {"chat_id": referrer_id}, {"referred_paid_count": 1}
-    )
+    doc = await users.find_one({"chat_id": referrer_id}, {"referred_paid_count": 1})
     count = int(doc.get("referred_paid_count") or 0)
     return True, count, referrer_id
 
 
-async def process_referral_reward_if_needed(
-    buyer_id: int,
-) -> tuple[bool, int, Optional[int]]:
+async def process_referral_reward_if_needed(buyer_id: int) -> tuple[bool, int, Optional[int]]:
     credited, paid_count, referrer_id = await mark_referral_paid_if_first(buyer_id)
     if not credited or not referrer_id:
         return False, paid_count, referrer_id
@@ -699,11 +665,9 @@ async def process_referral_reward_if_needed(
     return False, paid_count, referrer_id
 
 
-# --- Compatibility layer for PayShark webhooks (older imports) ---
+# --- Compatibility layer (если где-то остался старый webhook-код) ---
 
 async def create_payment_intent(plan: str, chat_id: int, username: str | None = None) -> dict | None:
-    # PayShark uses hosted payment links; intent is created on provider side.
-    # We keep this for backward compatibility with older webhook code.
     return None
 
 
@@ -714,7 +678,6 @@ async def get_payment(order_id: str | None = None, payment_id: str | None = None
     doc = await payment_get(key)
     if doc:
         return doc
-    # sometimes provider sends external_id separately
     return await payment_find_by_external_id(key)
 
 
@@ -725,7 +688,12 @@ async def mark_payment_status(payment_id: str, status: str, raw: dict | None = N
     await payment_set_status(key, status=str(status), raw_event=raw, external_id=key)
 
 
-async def grant_paid_access(chat_id: int, plan: str, payment_id: str | None = None, order_id: str | None = None) -> bool:
+async def grant_paid_access(
+    chat_id: int,
+    plan: str,
+    payment_id: str | None = None,
+    order_id: str | None = None,
+) -> bool:
     plan_s = str(plan or "").strip().lower()
     if plan_s not in {"lite", "pro"}:
         return False
@@ -733,9 +701,8 @@ async def grant_paid_access(chat_id: int, plan: str, payment_id: str | None = No
     pay_key = str(order_id or payment_id or f"{chat_id}:{plan_s}").strip()
     doc = await payment_get(pay_key)
     if not doc:
-        # create a minimal record so we can mark it processed idempotently
         try:
-            amt = float(PAYSHARK_LITE_PRICE if plan_s == "lite" else PAYSHARK_PRO_PRICE)
+            amt = float(LITE_PRICE if plan_s == "lite" else PRO_PRICE)
         except Exception:
             amt = 0.0
         await payment_create(
@@ -744,7 +711,7 @@ async def grant_paid_access(chat_id: int, plan: str, payment_id: str | None = No
             plan=plan_s,
             amount=amt,
             currency="RUB",
-            provider="payshark",
+            provider="wata",
             raw_create=None,
         )
         doc = await payment_get(pay_key)

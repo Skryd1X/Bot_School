@@ -2,9 +2,10 @@ import os
 import json
 import asyncio
 import time
+import uuid
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus, urlencode, urlparse, parse_qsl, urlunparse
+from urllib.parse import quote_plus
 
 from aiogram import Router, F
 from aiogram.types import (
@@ -14,7 +15,6 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardRemove,
     BufferedInputFile,
-    InputMediaPhoto,
 )
 from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.context import FSMContext
@@ -27,11 +27,9 @@ from generators import stream_response_text, solve_from_image, quiz_from_answer
 from db import (
     ensure_user, can_use, inc_usage, get_status_text,
     get_all_chat_ids, drop_chat, set_optin,
-    get_prefs, get_pref_bool, set_pref,
+    get_prefs, set_pref,
     get_voice_settings, set_voice_settings,
     is_teacher_mode, set_teacher_mode,
-    get_priority, set_priority,
-    get_answer_style, set_answer_style,
     add_history, get_history, clear_history,
     remember_bookmark, forget_last_bookmark, get_last_bookmark,
     get_or_create_ref_code, get_referral_stats,
@@ -40,7 +38,7 @@ from db import (
     payment_create, payment_set_status,
 )
 
-from payshark_client import PaysharkClient, build_external_id
+from wata_client import WataClient
 
 from utils_export import pdf_from_answer_text
 from tts import tts_voice_ogg, split_for_tts
@@ -52,23 +50,43 @@ MIN_INTERVAL_SEND = 1.1
 MIN_EDIT_INTERVAL = 0.25
 MAX_TG_LEN = 4096
 
-LITE_PRICE = (os.getenv("PAYSHARK_LITE_PRICE") or os.getenv("LITE_PRICE_RUB") or os.getenv("LITE_PRICE") or os.getenv("TRIBUTE_LITE_PRICE") or "199.99").strip()
-PRO_PRICE = (os.getenv("PAYSHARK_PRO_PRICE") or os.getenv("PRO_PRICE_RUB") or os.getenv("PRO_PRICE") or os.getenv("TRIBUTE_PRO_PRICE") or "299.99").strip()
-PAYSHARK_LITE_URL = os.getenv("PAYSHARK_LITE_URL", "").strip()
-PAYSHARK_PRO_URL = os.getenv("PAYSHARK_PRO_URL", "").strip()
-PAYSHARK_CURRENCY = (os.getenv("PAYSHARK_CURRENCY") or "RUB").strip() or "RUB"
+# Prices from WATA_* or legacy vars (fallbacks kept)
+LITE_PRICE = (os.getenv("WATA_LITE_PRICE") or os.getenv("LITE_PRICE_RUB") or os.getenv("LITE_PRICE") or os.getenv("TRIBUTE_LITE_PRICE") or "199.99").strip()
+PRO_PRICE = (os.getenv("WATA_PRO_PRICE") or os.getenv("PRO_PRICE_RUB") or os.getenv("PRO_PRICE") or os.getenv("TRIBUTE_PRO_PRICE") or "299.99").strip()
+WATA_CURRENCY = (os.getenv("WATA_CURRENCY") or "RUB").strip() or "RUB"
+
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
-SUPPORT_CONTACT = (os.getenv("SUPPORT_CONTACT") or "@criptos_support\n@Skryd1X").strip()
+SUPPORT_CONTACT = (os.getenv("SUPPORT_CONTACT") or "@@Prometeus_ai\n@Skryd1X").strip()
 PROMO_CODE = os.getenv("PROMO_CODE", "uStudyPromoTest").strip()
 PROMO_PRO_DAYS = int(os.getenv("PROMO_PRO_DAYS", "365"))
-
 
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot").lstrip("@")
 REF_BONUS_THRESHOLD = int(os.getenv("REF_BONUS_THRESHOLD", "6"))
 
 TTS_ENABLED_DEFAULT_PRO = False
 TTS_CHUNK_LIMIT = 2500
-TTS_CHUNK_LIMIT = 2500
+
+
+def build_external_id(chat_id: int, plan: str) -> str:
+    # Unique identifier to match payments / webhooks
+    return f"tg-{int(chat_id)}-{str(plan).lower()}-{uuid.uuid4().hex}"
+
+
+def _as_float_price(value: str) -> float:
+    s = (value or "").strip().replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _get_link_attr(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
 
 # ----------------- ЯЗЫК / I18N -----------------
 
@@ -115,31 +133,17 @@ DEFAULT_LANG = "ru"
 
 LANG_SELECT_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [
-            KeyboardButton(text="🇷🇺 Русский"),
-            KeyboardButton(text="🇬🇧 English"),
-        ],
-        [
-            KeyboardButton(text="🇺🇿 Oʻzbek"),
-            KeyboardButton(text="🇰🇿 Қазақша"),
-        ],
-        [
-            KeyboardButton(text="🇩🇪 Deutsch"),
-            KeyboardButton(text="🇫🇷 Français"),
-        ],
-        [
-            KeyboardButton(text="🇪🇸 Español"),
-            KeyboardButton(text="🇹🇷 Türkçe"),
-        ],
-        [
-            KeyboardButton(text="🇦🇪 العربية"),
-            KeyboardButton(text="🇮🇳 हिन्दी"),
-        ],
+        [KeyboardButton(text="🇷🇺 Русский"), KeyboardButton(text="🇬🇧 English")],
+        [KeyboardButton(text="🇺🇿 Oʻzbek"), KeyboardButton(text="🇰🇿 Қазақша")],
+        [KeyboardButton(text="🇩🇪 Deutsch"), KeyboardButton(text="🇫🇷 Français")],
+        [KeyboardButton(text="🇪🇸 Español"), KeyboardButton(text="🇹🇷 Türkçe")],
+        [KeyboardButton(text="🇦🇪 العربية"), KeyboardButton(text="🇮🇳 हिन्दी")],
     ],
     resize_keyboard=True,
     is_persistent=True,
     input_field_placeholder="🌐 Choose language / Выберите язык…",
 )
+
 
 async def get_user_lang(chat_id: int) -> str:
     prefs = await get_prefs(chat_id)
@@ -147,6 +151,7 @@ async def get_user_lang(chat_id: int) -> str:
     if isinstance(lang, str) and lang in LANGUAGES:
         return lang
     return DEFAULT_LANG
+
 
 async def ensure_language_selected(message: Message) -> Optional[str]:
     """
@@ -162,6 +167,7 @@ async def ensure_language_selected(message: Message) -> Optional[str]:
         reply_markup=LANG_SELECT_KB,
     )
     return None
+
 
 def build_greeting(lang: str, is_free: bool, mode_title: str) -> str:
     if lang == "en":
@@ -181,7 +187,6 @@ def build_greeting(lang: str, is_free: bool, mode_title: str) -> str:
             f"Current bot mode: {mode_title}\n"
             "You can change it in ⚙️ Settings → 🎛 Bot mode."
         )
-    # default Russian
     return (
         "👋 Привет! Я — учебный помощник для школы и вузов.\n\n"
         "Что я умею:\n"
@@ -198,6 +203,7 @@ def build_greeting(lang: str, is_free: bool, mode_title: str) -> str:
         f"Текущий тип работы бота: {mode_title}\n"
         "Изменить можно в ⚙️ Настройки → 🎛 Тип работы бота."
     )
+
 
 # ----------------- РЕЖИМЫ БОТА -----------------
 
@@ -333,72 +339,6 @@ MODE_BUTTON_TEXT_TO_KEY: Dict[str, str] = {
     "📅 Учебный план по теме": "study_plan",
 }
 
-def _inject_query(url: str, extra: Dict[str, str]) -> str:
-    try:
-        u = urlparse(url)
-        q = dict(parse_qsl(u.query, keep_blank_values=True))
-        for k, v in (extra or {}).items():
-            if v is None:
-                continue
-            vv = str(v).strip()
-            if vv == "":
-                continue
-            q[k] = vv
-        nq = urlencode(q)
-        return urlunparse((u.scheme, u.netloc, u.path, u.params, nq, u.fragment))
-    except Exception:
-        return url
-
-def payshark_plan_url(plan: str, chat_id: int, username: Optional[str]) -> str:
-    base = PAYSHARK_LITE_URL if plan == "lite" else PAYSHARK_PRO_URL
-    if not base:
-        return ""
-    base = base.replace("{chat_id}", str(chat_id)).replace("{user_id}", str(chat_id)).replace("{client_id}", str(chat_id)).replace("{plan}", plan)
-    base = base.replace("{username}", (username or ""))
-    return _inject_query(base, {"chat_id": str(chat_id), "client_id": str(chat_id), "plan": plan, "username": username or ""})
-
-
-def _as_float_price(value: str) -> float:
-    s = (value or "").strip().replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
-
-
-def _format_payment_detail(detail: Any) -> str:
-    """Pretty-format payment_detail from H2H response (string/dict/list/etc)."""
-    if detail is None:
-        return ""
-    if isinstance(detail, str):
-        return detail.strip()
-    if isinstance(detail, (int, float, bool)):
-        return str(detail)
-    if isinstance(detail, list):
-        parts: List[str] = []
-        for it in detail:
-            s = _format_payment_detail(it)
-            if s:
-                parts.append(s)
-        return "\n".join(parts)
-    if isinstance(detail, dict):
-        lines: List[str] = []
-        for k, v in detail.items():
-            if v is None:
-                continue
-            kk = str(k).strip()
-            vv = v
-            if isinstance(v, (dict, list)):
-                vv = json.dumps(v, ensure_ascii=False)
-            vv_s = str(vv).strip()
-            if not vv_s:
-                continue
-            if kk:
-                lines.append(f"• {kk}: {vv_s}")
-            else:
-                lines.append(f"• {vv_s}")
-        return "\n".join(lines)
-    return str(detail)
 
 async def get_current_mode(chat_id: int) -> str:
     prefs = await get_prefs(chat_id)
@@ -407,9 +347,11 @@ async def get_current_mode(chat_id: int) -> str:
         return mode
     return "default"
 
+
 async def set_current_mode(chat_id: int, mode: str) -> None:
     key = mode if mode in BOT_MODES else "default"
     await set_pref(chat_id, "mode", key)
+
 
 async def apply_mode_to_text(chat_id: int, text: str) -> str:
     """
@@ -429,9 +371,11 @@ async def apply_mode_to_text(chat_id: int, text: str) -> str:
         return text
     return "\n\n".join(parts) + "\n\n" + text
 
+
 async def _plan_flags(chat_id: int) -> Tuple[bool, bool, bool]:
     t = (await get_status_text(chat_id)).lower()
     return ("план: free" in t, "план: lite" in t, "план: pro" in t)
+
 
 def plans_kb(show_back: bool = False) -> InlineKeyboardMarkup:
     row = [
@@ -443,10 +387,12 @@ def plans_kb(show_back: bool = False) -> InlineKeyboardMarkup:
         kb.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_subs")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
+
 def available_btn_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="📦 Доступные пакеты", callback_data="show_plans")]]
     )
+
 
 def answer_actions_kb(is_pro: bool) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = [[]]
@@ -458,6 +404,7 @@ def answer_actions_kb(is_pro: bool) -> InlineKeyboardMarkup:
         rows[0].append(InlineKeyboardButton(text="🔒 PDF (PRO)", callback_data="need_pro_pdf"))
         rows[0].append(InlineKeyboardButton(text="🔒 Проверить себя (PRO)", callback_data="need_pro_quiz"))
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def main_kb_for_plan(is_free: bool) -> ReplyKeyboardMarkup:
     if is_free:
@@ -477,6 +424,7 @@ def main_kb_for_plan(is_free: bool) -> ReplyKeyboardMarkup:
         input_field_placeholder="Напишите вопрос или пришлите фото… / Type a question or send a photo…",
     )
 
+
 SETTINGS_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔔 Включить авто-озвучку"), KeyboardButton(text="🔕 Выключить авто-озвучку")],
@@ -488,6 +436,7 @@ SETTINGS_KB = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
 
 MODE_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -503,18 +452,22 @@ MODE_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+
 _last_send_ts: Dict[int, float] = {}
 _next_allowed_by_chat: Dict[int, float] = {}
 _export_lock: Dict[int, float] = {}
 QUIZ_STATE: Dict[int, Dict] = {}
 
+
 async def _is_pro(chat_id: int) -> bool:
     _, _, pro = await _plan_flags(chat_id)
     return pro
 
+
 async def _is_free(chat_id: int) -> bool:
     free, _, _ = await _plan_flags(chat_id)
     return free
+
 
 async def _last_assistant_text(chat_id: int) -> Optional[str]:
     hist = await get_history(chat_id)
@@ -523,12 +476,15 @@ async def _last_assistant_text(chat_id: int) -> Optional[str]:
             return item.get("content") or ""
     return None
 
+
 def _ref_link_from_code(code: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
+
 
 def _share_button(link: str, caption: str) -> InlineKeyboardButton:
     share_url = f"https://t.me/share/url?url={quote_plus(link)}&text={quote_plus(caption)}"
     return InlineKeyboardButton(text="📤 Поделиться", url=share_url)
+
 
 async def _send_referral_card(message: Message):
     stats = await get_referral_stats(message.chat.id)
@@ -558,6 +514,7 @@ async def _send_referral_card(message: Message):
     ]])
     await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
+
 async def _respect_rate_limit(chat_id: int):
     now = time.monotonic()
     last = _last_send_ts.get(chat_id, 0.0)
@@ -565,6 +522,7 @@ async def _respect_rate_limit(chat_id: int):
     if wait > 0:
         await asyncio.sleep(wait)
     _last_send_ts[chat_id] = time.monotonic()
+
 
 async def safe_send(message: Message, text: str, **kwargs):
     await _respect_rate_limit(message.chat.id)
@@ -580,6 +538,7 @@ async def safe_send(message: Message, text: str, **kwargs):
             await _respect_rate_limit(message.chat.id)
             return await message.answer(text, **kwargs)
         raise
+
 
 async def safe_edit(message: Message, message_id: int, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
     try:
@@ -605,11 +564,13 @@ async def safe_edit(message: Message, message_id: int, text: str, reply_markup: 
             except Exception:
                 pass
 
+
 async def safe_delete(msg):
     try:
         await msg.delete()
     except Exception:
         pass
+
 
 async def show_cooldown_counter(message: Message, seconds_left: int):
     counter = await safe_send(message, f"🕒 Включен медленный режим (антиспам): {seconds_left} сек")
@@ -631,6 +592,7 @@ async def show_cooldown_counter(message: Message, seconds_left: int):
     except Exception:
         await safe_delete(counter)
 
+
 async def send_long_text(message: Message, text: str):
     if not text:
         await message.answer("Пустой ответ 😕", reply_markup=main_kb_for_plan(await _is_free(message.chat.id)))
@@ -640,6 +602,7 @@ async def send_long_text(message: Message, text: str):
             text[i:i + MAX_TG_LEN],
             reply_markup=main_kb_for_plan(await _is_free(message.chat.id)) if i + MAX_TG_LEN >= len(text) else None
         )
+
 
 async def show_subscriptions(message: Message):
     text = await get_status_text(message.chat.id)
@@ -652,13 +615,13 @@ async def show_subscriptions(message: Message):
     else:
         await message.answer(text)
 
+
 # ----------------- START / ЯЗЫК -----------------
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await ensure_user(message.chat.id)
 
-    # обработка реферального кода
     payload = None
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) > 1:
@@ -669,7 +632,6 @@ async def cmd_start(message: Message):
         if ref_id:
             await set_referrer_once(message.chat.id, ref_id)
 
-    # обязательно сначала выбрать язык
     prefs = await get_prefs(message.chat.id)
     lang = (prefs or {}).get("lang")
     if not isinstance(lang, str) or lang not in LANGUAGES:
@@ -680,7 +642,6 @@ async def cmd_start(message: Message):
         )
         return
 
-    # авто-озвучка для PRO по умолчанию (если включено в конфиге)
     if TTS_ENABLED_DEFAULT_PRO and await _is_pro(message.chat.id):
         vs = await get_voice_settings(message.chat.id)
         if not vs.get("auto"):
@@ -693,6 +654,7 @@ async def cmd_start(message: Message):
     greeting = build_greeting(lang, is_free, mode_cfg["title"])
     await message.answer(greeting, reply_markup=kb)
 
+
 @router.message(Command("language"))
 async def cmd_language(message: Message):
     await message.answer(
@@ -701,9 +663,11 @@ async def cmd_language(message: Message):
         reply_markup=LANG_SELECT_KB,
     )
 
+
 @router.message(F.text == "🌐 Язык бота")
 async def settings_language(message: Message):
     await cmd_language(message)
+
 
 @router.message(F.text.in_(list(LANG_BUTTONS.keys())))
 async def language_chosen(message: Message):
@@ -723,45 +687,54 @@ async def language_chosen(message: Message):
         reply_markup=kb,
     )
 
+
 # ----------------- МЕНЮ, НАСТРОЙКИ, FAQ -----------------
 
 @router.message(F.text == "🎁 Бонус за друзей")
 async def kb_referral(message: Message):
     await _send_referral_card(message)
 
+
 @router.message(Command("ref"))
 async def cmd_ref(message: Message):
     await _send_referral_card(message)
+
 
 @router.message(F.text == "🧾 Мои подписки")
 async def kb_subscriptions(message: Message):
     await show_subscriptions(message)
 
+
 @router.message(F.text == "🔼 Обновить план")
 async def kb_upgrade(message: Message):
     await message.answer("Выберите пакет:", reply_markup=plans_kb(show_back=False))
+
 
 @router.message(Command("plan"))
 async def cmd_plan(message: Message):
     await message.answer("Доступные пакеты:", reply_markup=plans_kb(show_back=True))
 
+
 @router.message(Command("status"))
 async def cmd_status(message: Message):
     await show_subscriptions(message)
+
 
 @router.message(Command("reset"))
 async def cmd_reset(message: Message):
     await clear_history(message.chat.id)
     await message.answer("🧹 Контекст очищен", reply_markup=main_kb_for_plan(await _is_free(message.chat.id)))
 
+
 @router.message(F.text == "⚙️ Настройки")
 async def open_settings(message: Message):
-    _, is_lite, is_pro = await _plan_flags(message.chat.id)
+    _, _, is_pro = await _plan_flags(message.chat.id)
     extra = "" if is_pro else "\n\nℹ️ Учитель, авто-озвучка, PDF и мини-тест — в PRO."
     await message.answer(
         "Настройки профиля:\n— авто-озвучка\n— режим Учителя\n— сброс контекста\n— тип работы бота" + extra,
         reply_markup=SETTINGS_KB
     )
+
 
 @router.message(F.text == "🎛 Тип работы бота")
 async def open_modes_menu(message: Message):
@@ -774,6 +747,7 @@ async def open_modes_menu(message: Message):
     )
     await message.answer(text, reply_markup=MODE_KB)
 
+
 @router.message(F.text.in_(tuple(MODE_BUTTON_TEXT_TO_KEY.keys())))
 async def set_mode_from_button(message: Message):
     key = MODE_BUTTON_TEXT_TO_KEY.get((message.text or "").strip())
@@ -784,17 +758,21 @@ async def set_mode_from_button(message: Message):
     text = f"Режим обновлён: {cfg['title']}\n\n{cfg['description']}"
     await message.answer(text, reply_markup=MODE_KB)
 
+
 @router.message(F.text == "◀️ Назад в настройки")
 async def back_to_settings_from_modes(message: Message):
     await open_settings(message)
+
 
 @router.message(F.text == "◀️ Назад в меню")
 async def back_from_settings(message: Message):
     await message.answer("Готово.", reply_markup=main_kb_for_plan(await _is_free(message.chat.id)))
 
+
 @router.message(F.text == "🧹 Сброс контекста")
 async def settings_reset_ctx(message: Message):
     await cmd_reset(message)
+
 
 @router.message(F.text == "👩‍🏫 Включить режим Учителя")
 async def settings_teacher_on(message: Message):
@@ -803,10 +781,12 @@ async def settings_teacher_on(message: Message):
     await set_teacher_mode(message.chat.id, True)
     await message.answer("👩‍🏫 Режим Учителя: ВКЛ.")
 
+
 @router.message(F.text == "👨‍🎓 Выключить режим Учителя")
 async def settings_teacher_off(message: Message):
     await set_teacher_mode(message.chat.id, False)
     await message.answer("👩‍🏫 Режим Учителя: ВЫКЛ.")
+
 
 @router.message(F.text == "🔔 Включить авто-озвучку")
 async def settings_voice_on(message: Message):
@@ -815,10 +795,12 @@ async def settings_voice_on(message: Message):
     await set_voice_settings(message.chat.id, auto=True)
     await message.answer("🔔 Авто-озвучка: ВКЛ.")
 
+
 @router.message(F.text == "🔕 Выключить авто-озвучку")
 async def settings_voice_off(message: Message):
     await set_voice_settings(message.chat.id, auto=False)
     await message.answer("🔕 Авто-озвучка: ВЫКЛ.")
+
 
 @router.message(Command("voice_on"))
 async def cmd_voice_on(message: Message):
@@ -827,10 +809,12 @@ async def cmd_voice_on(message: Message):
     await set_voice_settings(message.chat.id, auto=True)
     await message.answer("🎙 Озвучка ответов: ВКЛ. Буду присылать voice после текста.")
 
+
 @router.message(Command("voice_off"))
 async def cmd_voice_off(message: Message):
     await set_voice_settings(message.chat.id, auto=False)
     await message.answer("🎙 Озвучка ответов: ВЫКЛ. Кнопка «Озвучить» останется под ответами.")
+
 
 @router.message(Command("voice"))
 async def cmd_voice_name(message: Message):
@@ -839,6 +823,7 @@ async def cmd_voice_name(message: Message):
         return await message.answer("Пример: /voice aria")
     await set_voice_settings(message.chat.id, name=parts[1].strip())
     await message.answer(f"🎙 Голос: {parts[1].strip()}")
+
 
 @router.message(Command("voice_speed"))
 async def cmd_voice_speed(message: Message):
@@ -852,6 +837,7 @@ async def cmd_voice_speed(message: Message):
     await set_voice_settings(message.chat.id, speed=v)
     await message.answer(f"🎛 Скорость озвучки: {max(0.5, min(1.6, v)):.2f}")
 
+
 @router.message(Command("remember"))
 async def cmd_remember(message: Message):
     last = await _last_assistant_text(message.chat.id)
@@ -860,6 +846,7 @@ async def cmd_remember(message: Message):
     await remember_bookmark(message.chat.id, last)
     await message.answer("🔖 Сохранено в закладки. Достанешь через /bookmark или /forget для удаления.")
 
+
 @router.message(Command("bookmark"))
 async def cmd_bookmark(message: Message):
     bk = await get_last_bookmark(message.chat.id)
@@ -867,10 +854,12 @@ async def cmd_bookmark(message: Message):
         return await message.answer("Закладок пока нет.")
     await send_long_text(message, f"🔖 Последняя закладка:\n\n{bk}")
 
+
 @router.message(Command("forget"))
 async def cmd_forget(message: Message):
     ok = await forget_last_bookmark(message.chat.id)
     await message.answer("🗑 Удалил последнюю закладку." if ok else "Закладок не найдено.")
+
 
 @router.message(Command("explain"))
 async def cmd_explain(message: Message, state: FSMContext):
@@ -878,6 +867,7 @@ async def cmd_explain(message: Message, state: FSMContext):
         return await message.answer("👩‍🏫 Режим Учителя доступен только в PRO.", reply_markup=available_btn_kb())
     await message.answer("Отправь вопрос/задачу — объясню как учитель: простые шаги, типичные ошибки и мини-проверка.")
     await set_teacher_mode(message.chat.id, True)
+
 
 FAQ_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -890,12 +880,14 @@ FAQ_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+
 @router.message(F.text == "FAQ / Помощь")
 async def faq_main(message: Message):
     await message.answer(
         f"Выберите раздел:\n\n🆘 Поддержка:\n{SUPPORT_CONTACT}",
         reply_markup=FAQ_KB
     )
+
 
 @router.message(F.text == "Как пользоваться ботом")
 async def faq_how(message: Message):
@@ -915,6 +907,7 @@ async def faq_how(message: Message):
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
+
 @router.message(F.text == "Частые вопросы")
 async def faq_questions(message: Message):
     text = (
@@ -923,7 +916,7 @@ async def faq_questions(message: Message):
         "  Оплаченные услуги <b>не подлежат возврату</b>, так как оплата совершается добровольно, "
         "а до покупки есть возможность ознакомиться с функционалом.\n\n"
         "• <b>Как происходит оплата?</b>\n"
-        "  Через PayShark (платёжная форма). После оплаты доступ открывается автоматически.\n\n"
+        "  Через WATA (платёжная ссылка). После оплаты доступ открывается автоматически.\n\n"
         "• <b>Что умеет бот?</b>\n"
         "  Он помогает <i>разобрать задачи, пояснить теорию, оформить решение</i>. "
         "Это помощник, а не полноценная замена преподавателя.\n\n"
@@ -935,6 +928,7 @@ async def faq_questions(message: Message):
         "мини-тест — 3–4 вопроса для самопроверки."
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
+
 
 @router.message(F.text == "Пользовательское соглашение")
 async def faq_offer(message: Message):
@@ -967,13 +961,12 @@ async def faq_offer(message: Message):
         "7. Заключительные положения\n"
         "7.1. Настоящее Соглашение вступает в силу с момента начала использования Бота.\n"
         "7.2. Все возникающие вопросы, не урегулированные Соглашением, решаются в соответствии с действующим законодательством.\n"
-        "7.3. Контакты для обращений: @criptos_support, @Skryd1X"
+        "7.3. Контакты для обращений: @@Prometeus_ai, @Skryd1X"
     )
     if len(offer_text) > MAX_TG_LEN:
         await send_long_text(message, offer_text)
     else:
         await message.answer(offer_text)
-
 
 
 @router.message(F.text == "Политика конфиденциальности")
@@ -1056,11 +1049,10 @@ async def faq_privacy(message: Message):
 данные пользователей, осуществляется администрацией
 сайта/telegram бота в соответствии с законодательством РФ.
 2.4 Пользователь осознает и предоставляет согласие на сбор и
-обработку своих персональных данных Администрацией
-сайта/telegram бота в рамках и с целью, предусмотренными
-условиями Агентского договора; обязуется уведомлять
-Администрацию сайта/telegram бота об изменениях его
-персональных данных.
+обработку своих персональных данных Администрацией сайта/
+telegram бота в рамках и с целью, предусмотренными условиями
+Агентского договора; обязуется уведомлять Администрацию
+сайта/telegram бота об изменениях его персональных данных.
 
 
 3 ЗАКЛЮЧИТЕЛЬНЫЕ ПОЛОЖЕНИЯ
@@ -1086,19 +1078,22 @@ async def faq_privacy(message: Message):
         await send_long_text(message, privacy_text)
     else:
         await message.answer(privacy_text)
+
+
 @router.message(F.text == "Назад")
 async def faq_back(message: Message):
     await message.answer("Возврат в главное меню", reply_markup=main_kb_for_plan(await _is_free(message.chat.id)))
 
+
 # ----------------- АДМИНКА, РАССЫЛКИ -----------------
 
-import json
 from pathlib import Path
 
 SECRET_ADMIN_CODES = {c.strip() for c in os.getenv("SECRET_ADMIN_CODES", "").split(",") if c.strip()}
 ADMINS_FILE = Path("admins.json")
 MAX_ADMINS = 2
 ADMINS: set[int] = set()
+
 
 def _load_admins():
     global ADMINS
@@ -1110,16 +1105,20 @@ def _load_admins():
         except Exception:
             ADMINS = set()
 
+
 def _save_admins():
     try:
         ADMINS_FILE.write_text(json.dumps(sorted(list(ADMINS))), encoding="utf-8")
     except Exception:
         pass
 
+
 _load_admins()
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
+
 
 ADMIN_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -1128,6 +1127,7 @@ ADMIN_KB = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
 
 @router.message(lambda m: (m.text or "").strip() in SECRET_ADMIN_CODES)
 async def secret_code_grant(message: Message):
@@ -1143,11 +1143,13 @@ async def secret_code_grant(message: Message):
     _save_admins()
     await message.answer("✅ Вы добавлены как админ. Открываю админ-панель.", reply_markup=ADMIN_KB)
 
+
 @router.message(Command("admin"))
 async def cmd_admin_open(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("⛔ Доступно только админам.")
     await message.answer("Админ-панель:", reply_markup=ADMIN_KB)
+
 
 @router.message(F.text == "⏪ Выйти из админ режима")
 async def admin_logout(message: Message):
@@ -1159,15 +1161,18 @@ async def admin_logout(message: Message):
     else:
         await message.answer("Вы не в админ-режиме.", reply_markup=main_kb_for_plan(await _is_free(message.chat.id)))
 
+
 @router.message(Command("unsubscribe"))
 async def cmd_unsub(message: Message):
     await set_optin(message.chat.id, False)
     await message.answer("❌ Вы отписаны от рассылок. Включить снова: /subscribe")
 
+
 @router.message(Command("subscribe"))
 async def cmd_sub(message: Message):
     await set_optin(message.chat.id, True)
     await message.answer("✅ Вы подписаны на рассылки. Отключить: /unsubscribe")
+
 
 class AdminBroadcastStates(StatesGroup):
     waiting_for_text = State()
@@ -1175,18 +1180,22 @@ class AdminBroadcastStates(StatesGroup):
     waiting_for_caption = State()
     confirm = State()
 
+
 BROADCAST_CONCURRENCY = 20
 BROADCAST_DELAY_SEC = 0.03
+
 
 def _progress_bar(pct: float, width: int = 12) -> str:
     done = int(round(pct * width))
     return f"[{'█' * done}{'—' * (width - done)}] {int(pct * 100)}%"
+
 
 def _confirm_kb(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"bcast_confirm_{kind}"),
         InlineKeyboardButton(text="❌ Отменить", callback_data="bcast_cancel"),
     ]])
+
 
 @router.message(F.text == "📊 Кол-во подписчиков")
 async def admin_count(message: Message):
@@ -1195,12 +1204,14 @@ async def admin_count(message: Message):
     ids = await get_all_chat_ids()
     await message.answer(f"Подписчиков (в базе): {len(ids)}")
 
+
 @router.message(F.text == "📢 Рассылка — текст")
 async def admin_broadcast_text_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.set_state(AdminBroadcastStates.waiting_for_text)
     await message.answer("Пришлите текст рассылки (plain/markdown).")
+
 
 @router.message(AdminBroadcastStates.waiting_for_text, F.text)
 async def admin_broadcast_text_preview(message: Message, state: FSMContext):
@@ -1210,6 +1221,7 @@ async def admin_broadcast_text_preview(message: Message, state: FSMContext):
     await message.answer(message.text)
     await message.answer("Разослать?", reply_markup=_confirm_kb("text"))
 
+
 @router.message(F.text == "🖼️ Рассылка — фото")
 async def admin_broadcast_photo_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -1217,11 +1229,13 @@ async def admin_broadcast_photo_start(message: Message, state: FSMContext):
     await state.set_state(AdminBroadcastStates.waiting_for_photo)
     await message.answer("Пришлите фото для рассылки.")
 
+
 @router.message(AdminBroadcastStates.waiting_for_photo, F.photo)
 async def admin_broadcast_photo_got(message: Message, state: FSMContext):
     await state.update_data(kind="photo", file_id=message.photo[-1].file_id)
     await state.set_state(AdminBroadcastStates.waiting_for_caption)
     await message.answer("Добавьте подпись к фото (или пришлите «-» чтобы без подписи).")
+
 
 @router.message(AdminBroadcastStates.waiting_for_caption, F.text)
 async def admin_broadcast_photo_preview(message: Message, state: FSMContext):
@@ -1233,11 +1247,13 @@ async def admin_broadcast_photo_preview(message: Message, state: FSMContext):
     await message.answer_photo(photo=data["file_id"], caption=caption)
     await message.answer("Разослать?", reply_markup=_confirm_kb("photo"))
 
+
 @router.callback_query(F.data == "bcast_cancel")
 async def admin_broadcast_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text("Рассылка отменена.")
     await call.answer()
+
 
 async def _deliver_to_all(bot, send_corofn, progress_msg: Message):
     ids: List[int] = await get_all_chat_ids()
@@ -1288,6 +1304,7 @@ async def _deliver_to_all(bot, send_corofn, progress_msg: Message):
     except Exception:
         pass
 
+
 @router.callback_query(F.data.in_(("bcast_confirm_text", "bcast_confirm_photo")))
 async def admin_broadcast_confirm(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
@@ -1314,10 +1331,14 @@ async def admin_broadcast_confirm(call: CallbackQuery, state: FSMContext):
         await _deliver_to_all(bot, sender, progress)
     await call.answer()
 
+
+# ----------------- ПЛАНЫ / ОПЛАТА (WATA) -----------------
+
 @router.callback_query(F.data == "show_plans")
 async def cb_show_plans(call: CallbackQuery):
     await call.message.edit_text("Доступные пакеты:", reply_markup=plans_kb(show_back=True))
     await call.answer()
+
 
 @router.callback_query(F.data.in_(("pay_lite", "pay_pro")))
 async def cb_pay_plan(call: CallbackQuery):
@@ -1326,7 +1347,7 @@ async def cb_pay_plan(call: CallbackQuery):
     plan = "lite" if call.data == "pay_lite" else "pro"
     price_str = LITE_PRICE if plan == "lite" else PRO_PRICE
     amount_f = _as_float_price(price_str)
-    amount = int(round(float(amount_f)))
+    title = "LITE" if plan == "lite" else "PRO"
 
     if not PUBLIC_BASE_URL:
         await call.message.answer(
@@ -1337,117 +1358,77 @@ async def cb_pay_plan(call: CallbackQuery):
         return
 
     external_id = build_external_id(chat_id, plan)
-    title = "LITE" if plan == "lite" else "PRO"
 
-    # маленький toast в телеге
-    await call.answer("Создаю реквизиты...")
+    await call.answer("Создаю ссылку оплаты...")
 
     try:
-        api = PaysharkClient()
-
-        payment_detail_type = (os.getenv("PAYSHARK_PAYMENT_DETAIL_TYPE") or "card").strip() or "card"
-        # Режим "любой банк": currency=rub, без payment_gateway (как в примере Payshark)
-        anybank = (os.getenv("PAYSHARK_ANYBANK") or "true").strip().lower() in {"1", "true", "yes", "y"}
-        currency = (os.getenv("PAYSHARK_CURRENCY") or "rub").strip() or "rub"
-        gateway = (os.getenv("PAYSHARK_PAYMENT_GATEWAY") or "").strip()
-
-        order = await api.create_h2h_order(
-            amount=int(amount),
-            external_id=external_id,
-            payment_detail_type=payment_detail_type,
-            currency=(currency if anybank else None),
-            payment_gateway=(None if anybank else (gateway or None)),
+        client = WataClient()
+        link = await client.create_payment_link(
+            amount=float(amount_f),
+            currency=WATA_CURRENCY,
+            order_id=external_id,
             description=f"uStudy plan={plan} chat_id={chat_id} username={username}",
+            success_redirect_url=f"{PUBLIC_BASE_URL}/payment/success",
+            fail_redirect_url=f"{PUBLIC_BASE_URL}/payment/fail",
+            link_type=(os.getenv("WATA_LINK_TYPE") or "OneTime").strip() or "OneTime",
         )
     except Exception as e:
-        import logging, re
-
-        log = logging.getLogger("payments")
-        code = "H2H_ERR"
-        msg = str(e)
-
-        m = re.search(r"Payshark H2H HTTP\s+(\d{3})", msg)
-        if m:
-            code = f"H2H_HTTP_{m.group(1)}"
-
-        try:
-            log.exception("Payshark H2H error | chat_id=%s plan=%s ext=%s", chat_id, plan, external_id)
-        except Exception:
-            pass
-
-        user_reason = None
-        if msg.startswith("Payshark H2H error:"):
-            user_reason = msg.replace("Payshark H2H error:", "").strip()
-        elif "Подходящие платежные реквизиты" in msg:
-            user_reason = "Подходящие платежные реквизиты не найдены (у мерчанта не настроен этот способ оплаты)."
-        elif "Invalid Access Token" in msg:
-            user_reason = "Invalid Access Token (неверный PAYSHARK_ACCESS_TOKEN)."
-
-        if user_reason:
-            await call.message.answer(
-                "💳 Оплата временно недоступна.\n"
-                f"Причина: {user_reason}\n"
-                f"Код: {code}\n"
-                f"Поддержка: {SUPPORT_CONTACT}"
-            )
-        else:
-            await call.message.answer(
-                "💳 Оплата временно недоступна.\n"
-                f"Код: {code}\n"
-                f"Поддержка: {SUPPORT_CONTACT}"
-            )
+        await call.message.answer(
+            "💳 Оплата временно недоступна.\n"
+            f"Причина: {str(e)[:900]}\n"
+            f"Поддержка: {SUPPORT_CONTACT}"
+        )
         await call.answer()
         return
 
-    # фиксируем в Mongo
+    pay_id = str(_get_link_attr(link, "id", "")) or str(_get_link_attr(link, "pay_id", "")) or external_id
+    pay_url = str(_get_link_attr(link, "url", "")) or str(_get_link_attr(link, "payment_url", ""))
+    pay_status = str(_get_link_attr(link, "status", "created"))
+    pay_currency = str(_get_link_attr(link, "currency", WATA_CURRENCY) or WATA_CURRENCY)
+    pay_amount = float(_get_link_attr(link, "amount", amount_f) or amount_f)
+    raw = _get_link_attr(link, "raw", None)
+
+    if not pay_url:
+        await call.message.answer(
+            "💳 Не удалось получить ссылку оплаты.\n"
+            f"Поддержка: {SUPPORT_CONTACT}"
+        )
+        await call.answer()
+        return
+
     try:
         await payment_create(
-            pay_id=str(order.order_id),
+            pay_id=pay_id,
             chat_id=int(chat_id),
             plan=str(plan),
-            amount=float(amount),
-            currency=str(order.currency or PAYSHARK_CURRENCY or "RUB"),
-            provider="payshark",
-            raw_create=order.raw,
+            amount=float(pay_amount),
+            currency=str(pay_currency),
+            provider="wata",
+            raw_create=raw,
         )
         await payment_set_status(
-            str(order.order_id),
-            status=str(order.status or "created"),
+            pay_id,
+            status=pay_status,
             raw_event=None,
-            external_id=str(order.external_id or external_id),
+            external_id=external_id,
         )
     except Exception:
-        # если БД недоступна, всё равно покажем пользователю реквизиты
         pass
 
-    detail_txt = _format_payment_detail(order.payment_detail)
-
-    text_parts: List[str] = [
-        f"💳 Оплата {title} через PayShark (H2H)",
-        "",
-        f"Сумма: {price_str} ₽",
-    ]
-    if order.order_id:
-        text_parts.append(f"ID сделки: {order.order_id}")
-    text_parts.append("")
-    if detail_txt:
-        text_parts.append("Реквизиты для оплаты:")
-        text_parts.append(detail_txt)
-        text_parts.append("")
-
-    text_parts.append(
-        "После оплаты доступ откроется автоматически. "
-        f"Если в течение 2–3 минут не открылся — напишите в поддержку {SUPPORT_CONTACT} и приложите чек/ID сделки."
+    text = (
+        f"💳 Оплата {title} через WATA\n\n"
+        f"Сумма: {price_str} {pay_currency}\n"
+        f"ID: {pay_id}\n\n"
+        "После оплаты доступ откроется автоматически.\n"
+        f"Если в течение 2–3 минут не открылся — напишите в поддержку {SUPPORT_CONTACT} и приложите чек/ID."
     )
 
-    kb_rows: List[List[InlineKeyboardButton]] = []
-    if order.link_page_url:
-        kb_rows.append([InlineKeyboardButton(text="💳 Перейти к оплате", url=order.link_page_url)])
-    kb_rows.append([InlineKeyboardButton(text="🧾 Проверить статус", callback_data="pay_check_status")])
-
-    await call.message.answer("\n".join(text_parts), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    kb_rows = [
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
+        [InlineKeyboardButton(text="🧾 Проверить статус", callback_data="pay_check_status")],
+    ]
+    await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await call.answer()
-
 
 
 @router.callback_query(F.data == "pay_check_status")
@@ -1467,11 +1448,13 @@ async def cb_back_to_subs(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
 
+
 # ----------------- ОСНОВНОЙ ФЛОУ: ТЕКСТ -----------------
 
 @router.message(StateFilter('generating'))
 async def wait_response(message: Message):
     await safe_send(message, "⏳ Ответ генерируется... дождитесь окончания предыдущего запроса!")
+
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def generate_answer(message: Message, state: FSMContext):
@@ -1480,11 +1463,9 @@ async def generate_answer(message: Message, state: FSMContext):
     if not user_text:
         return
 
-    # нажали кнопку выбора языка — здесь ничего не делаем
     if user_text in LANG_BUTTONS:
         return
 
-    # промокод тестового доступа (школьники-тестировщики)
     if PROMO_CODE and user_text.lower() == PROMO_CODE.lower():
         await ensure_user(chat_id)
         activated, exp = await apply_promocode_access(chat_id, PROMO_CODE, days=PROMO_PRO_DAYS)
@@ -1514,10 +1495,11 @@ async def generate_answer(message: Message, state: FSMContext):
         return
     _next_allowed_by_chat[chat_id] = now + COOLDOWN_SECONDS
 
-    allowed, msg = await can_use(user_db_id, "text")
+    allowed, msg = await can_use(chat_id, "text")
     if not allowed:
         await message.answer(msg, reply_markup=plans_kb(show_back=True))
         return
+
     is_pro = await _is_pro(chat_id)
     if is_pro and await is_teacher_mode(chat_id):
         user_text = (
@@ -1525,7 +1507,9 @@ async def generate_answer(message: Message, state: FSMContext):
             "где часто ошибаются, мини-проверка на 2–3 вопроса в конце.\n\nВопрос: "
             + user_text
         )
+
     user_text = await apply_mode_to_text(chat_id, user_text)
+
     await state.set_state("generating")
     await message.bot.send_chat_action(chat_id, ChatAction.TYPING)
     draft = await safe_send(message, "Думаю…")
@@ -1550,6 +1534,7 @@ async def generate_answer(message: Message, state: FSMContext):
             if t - last_edit >= MIN_EDIT_INTERVAL:
                 await safe_edit(message, draft.message_id, accumulated or "…")
                 last_edit = t
+
         final_text = (f"⚡ PRO-приоритет\n{accumulated}" if is_pro else accumulated) if accumulated else ""
         if final_text:
             if len(final_text) > MAX_TG_LEN:
@@ -1560,19 +1545,23 @@ async def generate_answer(message: Message, state: FSMContext):
                 await safe_edit(message, draft.message_id, final_text, reply_markup=answer_actions_kb(is_pro))
         else:
             await safe_edit(message, draft.message_id, "Пустой ответ 😕")
+
         await add_history(chat_id, "user", user_text)
         await add_history(chat_id, "assistant", accumulated or "")
         await inc_usage(chat_id, "text")
+
         if is_pro:
             vs = await get_voice_settings(chat_id)
             if vs.get("auto") and accumulated:
                 await _send_tts_for_text(message, accumulated)
+
     except Exception as e:
         await safe_edit(message, draft.message_id, f"❌ Ошибка: {e}")
     finally:
         typing_alive = False
         typing_task.cancel()
         await state.clear()
+
 
 # ----------------- ФОТО -----------------
 
@@ -1596,6 +1585,7 @@ async def on_photo(message: Message, state: FSMContext):
     if not allowed:
         await message.answer(msg, reply_markup=plans_kb(show_back=True))
         return
+
     await state.set_state("generating")
     await message.bot.send_chat_action(chat_id, ChatAction.TYPING)
     draft = await safe_send(message, "Распознаю задачу с фото…")
@@ -1605,16 +1595,20 @@ async def on_photo(message: Message, state: FSMContext):
         buf = BytesIO()
         await message.bot.download_file(file.file_path, buf)
         image_bytes = buf.getvalue()
+
         teacher_hint = ""
         if await _is_pro(chat_id) and await is_teacher_mode(chat_id):
             teacher_hint = "Объясняй как учитель: короткое введение, пошагово, типичные ошибки, в конце мини-проверка (2–3 вопроса). "
+
         base_hint = teacher_hint + "Распознай условие и реши задачу. Покажи формулы, вычисления и итог."
         hint_text = await apply_mode_to_text(chat_id, base_hint)
+
         answer = await solve_from_image(
             image_bytes,
             hint=hint_text,
             history=await get_history(chat_id)
         )
+
         is_pro = await _is_pro(chat_id)
         final_text = f"⚡ PRO-приоритет\n{answer}" if (is_pro and answer) else (answer or "Не удалось распознать задачу.")
         if len(final_text) > MAX_TG_LEN:
@@ -1627,17 +1621,21 @@ async def on_photo(message: Message, state: FSMContext):
                 message, draft.message_id, final_text,
                 reply_markup=answer_actions_kb(is_pro and bool(answer))
             )
+
         await add_history(chat_id, "user", "[Фото задачи]")
         await add_history(chat_id, "assistant", answer or "")
         await inc_usage(chat_id, "photo")
+
         if is_pro:
             vs = await get_voice_settings(chat_id)
             if vs.get("auto") and answer:
                 await _send_tts_for_text(message, answer)
+
     except Exception as e:
         await safe_edit(message, draft.message_id, f"❌ Ошибка по фото: {e}")
     finally:
         await state.clear()
+
 
 # ----------------- TTS / PDF / QUIZ -----------------
 
@@ -1659,6 +1657,7 @@ async def cb_tts_say(call: CallbackQuery):
             await call.message.answer(f"❌ Ошибка озвучки: {e}")
         except Exception:
             pass
+
 
 @router.callback_query(F.data == "export_pdf")
 async def cb_export_pdf(call: CallbackQuery):
@@ -1692,6 +1691,7 @@ async def cb_export_pdf(call: CallbackQuery):
         except Exception:
             pass
 
+
 def _quiz_kb(qi: dict, q_index: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     options = (qi.get("options") or [])[:4]
@@ -1704,6 +1704,7 @@ def _quiz_kb(qi: dict, q_index: int) -> InlineKeyboardMarkup:
         )
     builder.adjust(1)
     return builder.as_markup()
+
 
 @router.callback_query(F.data == "quiz_make")
 async def cb_quiz_make(call: CallbackQuery):
@@ -1725,6 +1726,7 @@ async def cb_quiz_make(call: CallbackQuery):
         await call.message.answer(text, reply_markup=_quiz_kb(q0, 0))
     except Exception as e:
         await call.message.answer(f"❌ Не удалось построить тест: {e}")
+
 
 @router.callback_query(F.data.startswith("quiz_answer:"))
 async def cb_quiz_answer(call: CallbackQuery):
@@ -1760,11 +1762,12 @@ async def cb_quiz_answer(call: CallbackQuery):
     except Exception:
         await call.answer("Ошибка обработки ответа.", show_alert=True)
 
-@router.callback_query(F.data.in_(("need_pro_pdf", "need_pro_quiz")))
+
 @router.callback_query(F.data.in_(("need_pro_pdf", "need_pro_quiz")))
 async def cb_need_pro(call: CallbackQuery):
     await call.answer("Функция доступна только в PRO.", show_alert=True)
     await call.message.answer("Оформите PRO, чтобы открыть PDF и мини-тест:", reply_markup=plans_kb(show_back=False))
+
 
 async def _send_tts_for_text(message: Message, text: str):
     chunks = split_for_tts(text, max_chars=TTS_CHUNK_LIMIT)

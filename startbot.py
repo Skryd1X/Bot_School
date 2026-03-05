@@ -16,7 +16,7 @@ if not BOT_TOKEN:
 
 MODE = (os.getenv("MODE") or "polling").strip().lower()
 
-USE_PAYSHARK = (os.getenv("USE_PAYSHARK") or "false").lower() == "true"
+USE_WATA = (os.getenv("USE_WATA") or "false").lower() == "true"
 RUN_WEBHOOK_SERVER = (os.getenv("RUN_WEBHOOK_SERVER") or "false").lower() == "true"
 
 WEBHOOK_HOST = (os.getenv("WEBHOOK_HOST") or "0.0.0.0").strip()
@@ -28,7 +28,7 @@ def _want_webhook_server() -> bool:
         return True
     if MODE in {"both", "hybrid"}:
         return True
-    return bool(RUN_WEBHOOK_SERVER or USE_PAYSHARK)
+    return bool(RUN_WEBHOOK_SERVER or USE_WATA)
 
 
 def _want_polling() -> bool:
@@ -68,7 +68,6 @@ async def run_webhook_server(bot):
     import uvicorn
     from webhooks import app
 
-    # чтобы webhooks.py мог отправлять notify пользователю после оплаты
     app.state.bot = bot
 
     config = uvicorn.Config(
@@ -112,18 +111,15 @@ async def _run_until_first_exception(tasks: list[asyncio.Task]):
 
 async def main():
     log.info(
-        "Mode=%s | polling=%s | webhook_server=%s | payshark=%s",
+        "Mode=%s | polling=%s | webhook_server=%s | wata=%s",
         MODE,
         _want_polling(),
         _want_webhook_server(),
-        "on" if USE_PAYSHARK else "off",
+        "on" if USE_WATA else "off",
     )
 
-    if MODE == "webhook" and not _want_webhook_server():
-        log.warning("MODE=webhook, but webhook_server is disabled by settings")
-
-    if USE_PAYSHARK and not _want_webhook_server():
-        log.warning("USE_PAYSHARK=true, but webhook server will not start (callbacks may not work)")
+    if USE_WATA and not _want_webhook_server():
+        log.warning("USE_WATA=true, but webhook server will not start (webhooks may not work)")
 
     bot = await _create_bot()
 
@@ -136,7 +132,7 @@ async def main():
             tasks.append(asyncio.create_task(run_webhook_server(bot), name="webhook_server"))
 
         if not tasks:
-            raise RuntimeError("Nothing to run: check MODE/USE_PAYSHARK/RUN_WEBHOOK_SERVER")
+            raise RuntimeError("Nothing to run: check MODE/USE_WATA/RUN_WEBHOOK_SERVER")
 
         await _run_until_first_exception(tasks)
     finally:
@@ -146,4 +142,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
